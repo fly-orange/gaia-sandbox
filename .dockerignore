@@ -1,0 +1,11 @@
+.git
+.venv
+.uv-cache
+.env
+config.toml
+runs
+data
+__pycache__
+.pytest_cache
+.ruff_cache
+vendor

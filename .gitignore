@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.uv-cache/
+.env
+/config.toml
+/runs/
+/data/
+/dist/
+*.egg-info/
+# vendor/ intentionally tracked: never add .upstream or nested git repositories.
