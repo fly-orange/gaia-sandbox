@@ -47,6 +47,8 @@ def main():
             key = os.getenv(cfg.llm["api_key_env"])
             if not key:
                 raise ValueError(f"Set {cfg.llm['api_key_env']}")
+            if cfg.agent["tavily"] and not os.getenv("TAVILY_API_KEY"):
+                raise ValueError("Set TAVILY_API_KEY or disable agent.tavily")
             service = SharedService(
                 cfg,
                 DockerFactory(cfg.sandbox),
@@ -77,6 +79,9 @@ def main():
             import openhands.sdk
 
             import docker
+
+            if cfg.agent["tavily"] and not os.getenv("TAVILY_API_KEY"):
+                raise ValueError("Set TAVILY_API_KEY or disable agent.tavily")
 
             print("SDK source:", openhands.sdk.__file__)
             with docker.from_env() as client:

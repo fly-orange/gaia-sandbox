@@ -21,19 +21,16 @@ from typing import (
     overload,
 )
 
-from pydantic import BaseModel
-
 from openhands.sdk.context.condenser.base import CondenserBase
 from openhands.sdk.context.view import View
 from openhands.sdk.conversation.types import ConversationTokenCallbackType
 from openhands.sdk.event.base import LLMConvertibleEvent
 from openhands.sdk.event.condenser import Condensation
 from openhands.sdk.llm import LLM, LLMResponse, Message
-from openhands.sdk.tool import ToolDefinition
+from openhands.sdk.tool import Action, ToolDefinition
 
 
 if TYPE_CHECKING:
-    from openhands.sdk.llm.llm import LLMCallContext
     from openhands.sdk.llm.streaming import AnyTokenCallbackType
 
 
@@ -75,69 +72,13 @@ def sanitize_json_control_chars(raw: str) -> str:
     return _CONTROL_CHAR_RE.sub(_escape_control_char, raw)
 
 
-def _is_chunked_str_field(value: Any, expected_origins: list[Any]) -> bool:
-    """Return True if a str-only field was given a list of string chunks.
-
-    Some models (e.g. minimax-m2.5) split a single string argument such as
-    file_editor's old_str/new_str into a JSON array of chunks. Such a list is
-    rejoined into one string by the caller. ``str | list[str]`` fields are
-    excluded so a genuinely-valid list is never collapsed, and lists holding
-    non-strings are rejected so they fail validation instead of being silently
-    mangled.
-    """
-    return (
-        isinstance(value, list)
-        and str in expected_origins
-        and not any(exp in (list, dict) for exp in expected_origins)
-        and all(isinstance(part, str) for part in value)
-    )
-
-
-def _json_schema_expected_types(
-    schema: dict[str, Any], defs: dict[str, Any]
-) -> list[Any]:
-    ref = schema.get("$ref")
-    if isinstance(ref, str) and ref.startswith("#/$defs/"):
-        target = defs.get(ref.rsplit("/", 1)[-1])
-        if isinstance(target, dict):
-            return _json_schema_expected_types(target, defs)
-
-    expected: list[Any] = []
-    for key in ("anyOf", "oneOf"):
-        for option in schema.get(key, []):
-            if isinstance(option, dict):
-                expected.extend(_json_schema_expected_types(option, defs))
-
-    json_types = schema.get("type")
-    if isinstance(json_types, str):
-        json_types = [json_types]
-    if isinstance(json_types, list):
-        type_map = {
-            "array": list,
-            "boolean": bool,
-            "integer": int,
-            "number": float,
-            "object": dict,
-            "string": str,
-        }
-        expected.extend(
-            type_map[json_type] for json_type in json_types if json_type in type_map
-        )
-    return expected
-
-
 def fix_malformed_tool_arguments(
-    arguments: dict[str, Any], action_type: type[BaseModel] | dict[str, Any]
+    arguments: dict[str, Any], action_type: type[Action]
 ) -> dict[str, Any]:
-    """Fix malformed tool arguments emitted by some LLMs under native fn calling.
+    """Fix malformed tool arguments by decoding JSON strings for list/dict fields.
 
-    Two malformations are repaired:
-
-    1. list/dict parameters encoded as JSON strings (e.g. GLM 4.6), which are
-       decoded back into native arrays/objects (see example below).
-    2. str-only parameters emitted as a JSON array of string chunks (e.g.
-       minimax-m2.5 chunking file_editor's old_str/new_str), which are joined
-       back into a single string.
+    This function handles cases where certain LLMs (such as GLM 4.6) incorrectly
+    encode array/object parameters as JSON strings when using native function calling.
 
     Example raw LLM output from GLM 4.6:
     {
@@ -166,7 +107,7 @@ def fix_malformed_tool_arguments(
 
     Args:
         arguments: The parsed arguments dict from json.loads(tool_call.arguments).
-        action_type: The model or JSON Schema defining expected arguments.
+        action_type: The action type that defines the expected schema.
 
     Returns:
         The arguments dict with JSON strings decoded where appropriate.
@@ -176,44 +117,36 @@ def fix_malformed_tool_arguments(
 
     fixed_arguments = arguments.copy()
 
-    if isinstance(action_type, dict):
-        defs = action_type.get("$defs", {})
-        field_types = [
-            (field_name, _json_schema_expected_types(field_schema, defs))
-            for field_name, field_schema in action_type.get("properties", {}).items()
-            if isinstance(field_schema, dict)
-        ]
-    else:
-        field_types = []
-        for field_name, field_info in action_type.model_fields.items():
-            data_key = field_info.alias if field_info.alias else field_name
-            expected_type = field_info.annotation
-            if get_origin(expected_type) is Annotated:
-                type_args = get_args(expected_type)
-                expected_type = type_args[0] if type_args else expected_type
-
-            origin = get_origin(expected_type)
-            if origin is Union or origin is types.UnionType:
-                type_args = get_args(expected_type)
-                expected_origins = [get_origin(arg) or arg for arg in type_args]
-            else:
-                expected_origins = [origin or expected_type]
-            field_types.append((data_key, expected_origins))
-
-    for data_key, expected_origins in field_types:
+    # Use model_fields to properly handle aliases and inherited fields
+    for field_name, field_info in action_type.model_fields.items():
+        # Check both the field name and its alias (if any)
+        data_key = field_info.alias if field_info.alias else field_name
         if data_key not in fixed_arguments:
             continue
 
         value = fixed_arguments[data_key]
-
-        # Rejoin a str-only field that a model chunked into a JSON array.
-        if _is_chunked_str_field(value, expected_origins):
-            fixed_arguments[data_key] = "".join(value)
-            continue
-
-        # Skip non-strings — the JSON decoding below only works on strings.
+        # Skip if value is not a string
         if not isinstance(value, str):
             continue
+
+        expected_type = field_info.annotation
+
+        # Unwrap Annotated types - only the first arg is the actual type
+        if get_origin(expected_type) is Annotated:
+            type_args = get_args(expected_type)
+            expected_type = type_args[0] if type_args else expected_type
+
+        # Get the origin of the expected type (e.g., list from list[str])
+        origin = get_origin(expected_type)
+
+        # For Union types, we need to check all union members
+        if origin is Union or origin is types.UnionType:
+            # For Union types, check each union member
+            type_args = get_args(expected_type)
+            expected_origins = [get_origin(arg) or arg for arg in type_args]
+        else:
+            # For non-Union types, just check the origin
+            expected_origins = [origin or expected_type]
 
         # Check if any of the expected types is list or dict
         if any(exp in (list, dict) for exp in expected_origins):
@@ -522,14 +455,10 @@ def normalize_tool_call(
                     for key, value in arguments.items()
                     if key in {"security_risk", "summary"}
                 }
-                if not original_command:
-                    normalized_arguments["command"] = base_name
-                elif str(original_command).split(maxsplit=1)[:1] == [base_name]:
-                    # Already carries the executable, e.g. git(command="git status").
-                    # Comparing whole tokens keeps "github status" prefixed.
-                    normalized_arguments["command"] = original_command
-                else:
+                if original_command:
                     normalized_arguments["command"] = f"{base_name} {original_command}"
+                else:
+                    normalized_arguments["command"] = base_name
         elif "terminal" in available_tools:
             terminal_command = _maybe_rewrite_as_terminal_command(
                 tool_name,
@@ -646,7 +575,6 @@ def make_llm_completion(
     messages: list[Message],
     tools: list[ToolDefinition] | None = None,
     on_token: ConversationTokenCallbackType | None = None,
-    call_context: LLMCallContext | None = None,
 ) -> LLMResponse:
     """Make an LLM completion call with the provided messages and tools.
 
@@ -655,7 +583,6 @@ def make_llm_completion(
         messages: The messages to send to the LLM
         tools: Optional list of tools to provide to the LLM
         on_token: Optional callback for streaming token updates
-        call_context: Per-conversation context for cache/session affinity.
 
     Returns:
         LLMResponse from the LLM completion call
@@ -680,7 +607,6 @@ def make_llm_completion(
             store=False,
             add_security_risk_prediction=True,
             on_token=on_token,
-            call_context=call_context,
         )
     else:
         return llm.completion(
@@ -688,7 +614,6 @@ def make_llm_completion(
             tools=tools or [],
             add_security_risk_prediction=True,
             on_token=on_token,
-            call_context=call_context,
         )
 
 
@@ -732,7 +657,6 @@ async def amake_llm_completion(
     messages: list[Message],
     tools: list[ToolDefinition] | None = None,
     on_token: AnyTokenCallbackType | None = None,
-    call_context: LLMCallContext | None = None,
 ) -> LLMResponse:
     """Async variant of :func:`make_llm_completion`."""
     if llm.uses_responses_api():
@@ -743,7 +667,6 @@ async def amake_llm_completion(
             store=False,
             add_security_risk_prediction=True,
             on_token=on_token,
-            call_context=call_context,
         )
     else:
         return await llm.acompletion(
@@ -751,5 +674,4 @@ async def amake_llm_completion(
             tools=tools or [],
             add_security_risk_prediction=True,
             on_token=on_token,
-            call_context=call_context,
         )

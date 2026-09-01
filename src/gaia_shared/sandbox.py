@@ -14,6 +14,24 @@ class DockerSandbox:
     client: object
     timeout: int
     image_id: str = ""
+    worker: object | None = None
+
+    def start_tools(self, config: dict, run_dir):
+        from .tool_bridge import WorkerConnection
+
+        self.worker = WorkerConnection(
+            ["docker", "exec", "-i", self.id, "/opt/gaia/.venv/bin/python", "-m", "gaia_shared.worker"],
+            run_dir / "tool-worker.log",
+        )
+        try:
+            return self.worker.call(
+                "initialize", config,
+                self.timeout + config["sandbox"]["tool_startup_timeout"],
+            )
+        except BaseException:
+            self.worker.close()
+            self.worker = None
+            raise
 
     @property
     def id(self):
@@ -66,6 +84,8 @@ class DockerSandbox:
 
     def close(self):
         try:
+            if self.worker is not None:
+                self.worker.close()
             self.container.remove(force=True)
         finally:
             self.client.close()
@@ -95,6 +115,7 @@ class DockerFactory:
                 mem_limit=s["memory"],
                 memswap_limit=s["memory"],
                 pids_limit=s["pids_limit"],
+                shm_size=s["shm_size"],
                 cap_drop=["ALL"],
                 security_opt=["no-new-privileges:true"],
                 labels={"gaia.role": "sandbox", "gaia.run_id": run_id},

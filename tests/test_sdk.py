@@ -15,7 +15,7 @@ async def test_real_sdk_two_conversations_bound_to_distinct_sandboxes(cfg, facto
     async def completion(self, messages, **kwargs):
         count = calls.get(self.usage_id, 0)
         calls[self.usage_id] = count + 1
-        name = "sandbox_command" if count == 0 else "finish"
+        name = "test_sandbox" if count == 0 else "finish"
         args = (
             {"command": "echo isolated"} if count == 0 else {"message": "<solution>42</solution>"}
         )
@@ -66,7 +66,7 @@ async def test_real_sdk_two_conversations_bound_to_distinct_sandboxes(cfg, facto
         ]
         system = next(e for e in events if e["kind"] == "SystemPromptEvent")
         kinds = {t["kind"] for t in system["tools"]}
-        assert kinds == {"SandboxCommandTool", "FinishTool", "ThinkTool"}
+        assert kinds == {"SandboxProxy0Tool", "FinishTool", "ThinkTool"}
 
 
 async def test_real_sdk_deadline_classified_as_timeout(cfg, factory, monkeypatch):

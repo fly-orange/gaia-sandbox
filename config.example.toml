@@ -14,13 +14,31 @@ api_key_env = "VLLM_API_KEY"
 max_output_tokens = 8192
 timeout = 120
 max_iterations = 30
+temperature = 0.0
+num_retries = 3
+vision = false
+
+[agent]
+tool_preset = "default"
+enable_condenser = true
+condenser_max_size = 240
+condenser_keep_first = 2
+max_fake_responses = 10
+public_skills = true
+# Keep both enabled for the upstream GAIA tool environment.
+tavily = true
+fetch = true
+mcp_init_timeout = 60
 
 [sandbox]
-image = "gaia-sandbox:0.1"
+image = "gaia-sandbox:0.2"
 cpus = 2.0
-memory = "2g"
+memory = "4g"
 pids_limit = 256
 command_timeout = 60
+tool_startup_timeout = 180
+tool_call_timeout = 360
+shm_size = "1g"
 # bridge permits web access. Use none for offline isolation tests.
 # Docker networking alone is NOT an egress firewall; see README security section.
 network = "bridge"

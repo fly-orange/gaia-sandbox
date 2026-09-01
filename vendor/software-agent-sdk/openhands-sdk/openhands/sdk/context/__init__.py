@@ -1,5 +1,4 @@
 from openhands.sdk.context.agent_context import AgentContext
-from openhands.sdk.context.memory import load_memory
 from openhands.sdk.context.prompts import render_template
 
 # Import from canonical location (openhands.sdk.skills)
@@ -25,7 +24,6 @@ __all__ = [
     "SkillKnowledge",
     "load_skills_from_dir",
     "load_user_skills",
-    "load_memory",
     "load_project_skills",
     "render_template",
     "SkillValidationError",

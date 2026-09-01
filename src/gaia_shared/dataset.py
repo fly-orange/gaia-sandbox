@@ -1,9 +1,12 @@
 import base64
+import io
 import json
 import re
-from pathlib import Path
+import stat
+import zipfile
+from pathlib import Path, PurePosixPath
 
-from .schema import MAX_ATTACHMENT, Attachment, TaskRequest
+from .schema import IMAGE_SUFFIXES, MAX_ATTACHMENT, MAX_ATTACHMENTS, Attachment, TaskRequest
 
 
 def read_instances(root: Path, split: str, level: int, limit: int):
@@ -45,11 +48,40 @@ def make_request(row, root: Path, split: str):
             raise ValueError("Attachment path escapes dataset split directory")
         if path.stat().st_size > MAX_ATTACHMENT:
             raise ValueError(f"Attachment exceeds 20 MiB: {path.name}")
-        attachments.append(
-            Attachment(
-                name=path.name, data_base64=base64.b64encode(path.read_bytes()).decode("ascii")
+        data = path.read_bytes()
+        suffix = path.suffix.lower()
+        if suffix == ".zip":
+            total = 0
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                files = [item for item in archive.infolist() if not item.is_dir()]
+                if len(files) > MAX_ATTACHMENTS:
+                    raise ValueError(f"ZIP contains more than {MAX_ATTACHMENTS} files")
+                for item in files:
+                    member = PurePosixPath(item.filename.replace("\\", "/"))
+                    name = member.name
+                    mode = item.external_attr >> 16
+                    if (
+                        not name
+                        or member.is_absolute()
+                        or ".." in member.parts
+                        or item.flag_bits & 1
+                        or stat.S_ISLNK(mode)
+                    ):
+                        raise ValueError(f"Unsafe ZIP member: {item.filename}")
+                    total += item.file_size
+                    if total > MAX_ATTACHMENT:
+                        raise ValueError("Extracted ZIP exceeds 20 MiB")
+                    attachments.append(
+                        Attachment(
+                            name=name,
+                            data_base64=base64.b64encode(archive.read(item)).decode("ascii"),
+                        )
+                    )
+        else:
+            name = path.name if suffix in IMAGE_SUFFIXES else f"file{suffix}"
+            attachments.append(
+                Attachment(name=name, data_base64=base64.b64encode(data).decode("ascii"))
             )
-        )
     return TaskRequest(
         task_id=str(row["task_id"]), question=row["Question"], attachments=attachments
     )

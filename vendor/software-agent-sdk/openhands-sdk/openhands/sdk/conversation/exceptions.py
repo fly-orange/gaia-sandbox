@@ -1,5 +1,4 @@
 from openhands.sdk.conversation.types import ConversationID
-from openhands.sdk.event.conversation_error import ConversationErrorEvent
 
 
 ISSUE_URL = "https://github.com/OpenHands/software-agent-sdk/issues/new"
@@ -33,7 +32,6 @@ class ConversationRunError(RuntimeError):
     conversation_id: ConversationID
     persistence_dir: str | None
     original_exception: BaseException
-    conversation_error: ConversationErrorEvent | None
 
     def __init__(
         self,
@@ -41,12 +39,10 @@ class ConversationRunError(RuntimeError):
         original_exception: BaseException,
         persistence_dir: str | None = None,
         message: str | None = None,
-        conversation_error: ConversationErrorEvent | None = None,
     ) -> None:
         self.conversation_id = conversation_id
         self.persistence_dir = persistence_dir
         self.original_exception = original_exception
-        self.conversation_error = conversation_error
         default_msg = self._build_error_message(
             conversation_id, original_exception, persistence_dir
         )

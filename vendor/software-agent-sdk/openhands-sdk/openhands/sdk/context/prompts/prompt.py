@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import tempfile
 from functools import lru_cache
 
 from jinja2 import (
@@ -61,7 +62,10 @@ def _get_env(prompt_dir: str) -> Environment:
     # BytecodeCache avoids reparsing templates across processes
     # Use user-specific cache directory to avoid permission issues
     # in multi-user environments
-    cache_folder = os.path.join(os.path.expanduser("~"), ".openhands", "cache", "jinja")
+    cache_folder = os.environ.get(
+        "OH_JINJA_CACHE_DIR",
+        os.path.join(tempfile.gettempdir(), f"openhands-jinja-{os.getpid()}"),
+    )
     os.makedirs(cache_folder, exist_ok=True)
     bcc = FileSystemBytecodeCache(directory=cache_folder)
     env = Environment(

@@ -12,7 +12,6 @@ from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.utils import CostPerToken, ModelResponse, Usage
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
-from openhands.sdk.llm.utils.litellm_provider import LLMProvider
 from openhands.sdk.llm.utils.metrics import Metrics
 from openhands.sdk.llm.utils.openhands_provider import litellm_call_kwargs
 from openhands.sdk.logger import get_logger
@@ -84,7 +83,6 @@ class Telemetry(BaseModel):
         self,
         resp: ModelResponse | ResponsesAPIResponse,
         raw_resp: ModelResponse | None = None,
-        provider_info: LLMProvider | None = None,
     ) -> Metrics:
         """
         Side-effects:
@@ -97,7 +95,7 @@ class Telemetry(BaseModel):
         self.metrics.add_response_latency(self._last_latency, response_id)
 
         # 2) cost
-        cost = self._compute_cost(resp, provider_info=provider_info)
+        cost = self._compute_cost(resp)
         # Intentionally skip logging zero-cost (0.0) responses; only record
         # positive cost
         if cost:
@@ -248,11 +246,7 @@ class Telemetry(BaseModel):
             response_id=response_id,
         )
 
-    def _compute_cost(
-        self,
-        resp: ModelResponse | ResponsesAPIResponse,
-        provider_info: LLMProvider | None = None,
-    ) -> float | None:
+    def _compute_cost(self, resp: ModelResponse | ResponsesAPIResponse) -> float | None:
         """Try provider header → litellm direct. Return None on failure."""
         extra_kwargs = {}
         if (
@@ -276,13 +270,13 @@ class Telemetry(BaseModel):
         except Exception as e:
             logger.debug(f"Failed to get cost from LiteLLM headers: {e}")
 
-        if provider_info is None:
-            call_kwargs = litellm_call_kwargs(self.model_name, None)
-            provider_info = LLMProvider.from_model(
-                model=call_kwargs["model"],
-                api_base=call_kwargs["api_base"],
-            )
-        extra_kwargs.update(provider_info.as_litellm_call_kwargs())
+        model = litellm_call_kwargs(self.model_name, None)["model"]
+        if "/" in model:
+            provider, bare = model.split("/", 1)
+            extra_kwargs["model"] = bare
+            extra_kwargs["custom_llm_provider"] = provider
+        else:
+            extra_kwargs["model"] = model
         try:
             return float(
                 litellm_completion_cost(completion_response=resp, **extra_kwargs)

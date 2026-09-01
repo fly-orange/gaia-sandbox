@@ -50,15 +50,7 @@ class RetryMixin:
             if isinstance(exc, LLMNoResponseError):
                 kwargs = getattr(retry_state, "kwargs", None)
                 if isinstance(kwargs, dict):
-                    current_temp = kwargs.get(
-                        "temperature", getattr(self, "temperature", None)
-                    )
-                    if current_temp is None:
-                        logger.warning(
-                            "LLMNoResponseError with no configured temperature, "
-                            "leaving temperature unset for next attempt."
-                        )
-                        return
+                    current_temp = kwargs.get("temperature", 0)
                     if current_temp == 0:
                         kwargs["temperature"] = 1.0
                         logger.warning(

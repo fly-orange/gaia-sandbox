@@ -1,80 +1,24 @@
-"""SDK conversations stay in this process; only the bound tool talks to Docker."""
+"""One host Agent loop; upstream tools execute in the task's container worker."""
 
-import base64
-import json
 import mimetypes
+import re
 from pathlib import Path
-from threading import Lock
 
-from openhands.sdk import (
-    LLM,
-    Action,
-    Agent,
-    ImageContent,
-    Message,
-    Observation,
-    TextContent,
-    ToolDefinition,
-)
+from openhands.sdk import LLM, Agent, ImageContent, Message, TextContent, Tool
 from openhands.sdk.context import AgentContext
+from openhands.sdk.context.condenser import LLMSummarizingCondenser
 from openhands.sdk.conversation import LocalConversation
-from openhands.sdk.tool import Tool, ToolExecutor, register_tool
-from pydantic import Field, SecretStr
+from openhands.sdk.event import ActionEvent, MessageEvent
+from openhands.sdk.tool.builtins.finish import FinishAction
+from pydantic import SecretStr
 
+from .benchmark import fake_user_response, instruction
 from .io import append_json, stamp
-
-_bindings = {}
-_lock = Lock()
-
-
-class SandboxCommand(Action):
-    command: str = Field(description="Bash command to run in this task's isolated sandbox")
-
-
-class CommandObservation(Observation):
-    output: str
-
-    @property
-    def to_llm_content(self):
-        return [TextContent(text=self.output)]
-
-
-class SandboxExecutor(ToolExecutor):
-    def __init__(self, sandbox):
-        self.sandbox = sandbox
-
-    def __call__(self, action, conversation=None):
-        return CommandObservation(output=json.dumps(self.sandbox.execute(action.command)))
-
-
-class SandboxCommandTool(ToolDefinition):
-    @classmethod
-    def create(cls, conv_state, binding_id: str):
-        # binding_id is supplied by trusted server code, never by the model.
-        with _lock:
-            sandbox = _bindings[binding_id]
-        return [
-            cls(
-                description=(
-                    "Execute bash in your private Linux container at /workspace. "
-                    "Use Python to read/write files, requests for webpages and "
-                    "Playwright for Chromium browsing. Commands do not retain shell "
-                    "cwd/env between calls; files persist throughout this task. "
-                    "You have no access to the agent server or other tasks."
-                ),
-                action_type=SandboxCommand,
-                observation_type=CommandObservation,
-                executor=SandboxExecutor(sandbox),
-            )
-        ]
-
-
-register_tool(SandboxCommandTool.name, SandboxCommandTool)
+from .skills import load_skills
+from .tool_bridge import SandboxToolSet, bind_tools, unbind_tools
 
 
 def extract_answer(events):
-    import re
-
     for event in reversed(events):
         if event.get("source") != "agent":
             continue
@@ -92,11 +36,17 @@ def extract_answer(events):
 
 class SDKSession:
     def __init__(self, cfg, key, run_id, sandbox, request, run_dir: Path):
-        self.run_id = run_id
-        self.events = []
-        self.conversation = None
-        with _lock:
-            _bindings[run_id] = sandbox
+        self.run_id, self.events, self.conversation = run_id, [], None
+        definitions = sandbox.worker.call(
+            "describe", {}, cfg.sandbox["tool_call_timeout"]
+        )
+        bind_tools(
+            run_id,
+            definitions["tools"],
+            sandbox.worker,
+            cfg.sandbox["tool_call_timeout"],
+            run_dir / "tool-calls.jsonl",
+        )
         try:
             llm = LLM(
                 model=cfg.llm["model"],
@@ -105,25 +55,32 @@ class SDKSession:
                 usage_id=f"gaia-{run_id}",
                 max_output_tokens=cfg.llm["max_output_tokens"],
                 timeout=cfg.llm["timeout"],
-                num_retries=1,
+                num_retries=cfg.llm["num_retries"],
+                temperature=cfg.llm["temperature"],
+                drop_params=True,
+                modify_params=True,
+                native_tool_calling=True,
             )
+            condenser = None
+            if cfg.agent["enable_condenser"]:
+                condenser = LLMSummarizingCondenser(
+                    llm=llm.model_copy(update={"usage_id": "condenser"}),
+                    max_size=cfg.agent["condenser_max_size"],
+                    keep_first=cfg.agent["condenser_keep_first"],
+                )
+            skills = (
+                load_skills(cfg.root / "vendor/extensions")
+                if cfg.agent["public_skills"]
+                else []
+            )
+            context = AgentContext(skills=skills) if skills else None
             agent = Agent(
                 llm=llm,
-                tools=[Tool(name=SandboxCommandTool.name, params={"binding_id": run_id})],
-                include_default_tools=["FinishTool", "ThinkTool"],
-                auto_attach_vision_tool=False,
-                agent_context=AgentContext(
-                    load_user_skills=False,
-                    load_project_skills=False,
-                    load_public_skills=False,
-                    system_message_suffix=(
-                        "Solve the GAIA question using only your private sandbox. "
-                        "Do not ask the user for help. Return the final answer with "
-                        "the finish tool, enclosed in <solution>...</solution>. "
-                        "Follow the question's formatting exactly. "
-                        "Only the sandbox command tool can access task files."
-                    ),
-                ),
+                tools=[Tool(name=SandboxToolSet.name, params={"binding_id": run_id})],
+                system_prompt_kwargs={"cli_mode": True, "enable_browser": True},
+                agent_context=context,
+                condenser=condenser,
+                auto_attach_skill_tool=False,
             )
             state_dir = run_dir / "sdk-state"
             state_dir.mkdir()
@@ -142,28 +99,52 @@ class SDKSession:
                 visualizer=None,
                 delete_on_close=False,
             )
-            text = request.question
-            if request.attachments:
-                text += "\nAttachments in your sandbox: " + ", ".join(
-                    "/workspace/" + a.name for a in request.attachments
-                )
-            content = [TextContent(text=text)]
+            content = [TextContent(text=instruction(request))]
             for attachment in request.attachments:
                 mime = mimetypes.guess_type(attachment.name)[0]
                 if mime in ("image/png", "image/jpeg", "image/webp", "image/gif"):
-                    # Input images go to the model; the same file is also in the sandbox.
-                    base64.b64decode(attachment.data_base64, validate=True)
                     content.append(
-                        ImageContent(image_urls=[f"data:{mime};base64,{attachment.data_base64}"])
+                        ImageContent(
+                            image_urls=[
+                                f"data:{mime};base64,{attachment.data_base64}"
+                            ]
+                        )
                     )
             self.conversation.send_message(Message(role="user", content=content))
+            self.max_fake_responses = cfg.agent["max_fake_responses"]
         except BaseException:
             self.close()
             raise
 
+    def _last_agent_finished(self):
+        for event in reversed(self.conversation.state.events):
+            if isinstance(event, ActionEvent):
+                return isinstance(event.action, FinishAction)
+        return False
+
+    def _last_agent_message(self):
+        for event in reversed(self.conversation.state.events):
+            if isinstance(event, MessageEvent) and event.source == "agent":
+                return True
+            if isinstance(event, ActionEvent):
+                return False
+        return False
+
     async def run(self):
-        await self.conversation.arun()
-        status = self.conversation.state.execution_status.value
+        fake_responses = 0
+        while True:
+            await self.conversation.arun()
+            status = self.conversation.state.execution_status.value
+            if (
+                status != "finished"
+                or self._last_agent_finished()
+                or not self._last_agent_message()
+            ):
+                break
+            if fake_responses >= self.max_fake_responses:
+                break
+            self.conversation.send_message(fake_user_response(fake_responses))
+            fake_responses += 1
         return {
             "answer": extract_answer(self.events),
             "conversation_status": status,
@@ -171,6 +152,7 @@ class SDKSession:
                 mode="json"
             ),
             "tool_calls": sum(e.get("kind") == "ActionEvent" for e in self.events),
+            "fake_user_responses": fake_responses,
         }
 
     def close(self):
@@ -178,5 +160,4 @@ class SDKSession:
             if self.conversation is not None:
                 self.conversation.close()
         finally:
-            with _lock:
-                _bindings.pop(self.run_id, None)
+            unbind_tools(self.run_id)

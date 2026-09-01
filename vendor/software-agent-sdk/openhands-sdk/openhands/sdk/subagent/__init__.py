@@ -1,5 +1,4 @@
 from openhands.sdk.subagent.load import (
-    discover_agents,
     load_agents_from_dir,
     load_project_agents,
     load_user_agents,
@@ -14,7 +13,7 @@ from openhands.sdk.subagent.registry import (
     register_file_agents,
     register_plugin_agents,
 )
-from openhands.sdk.subagent.schema import AgentDefinition, AgentDefinitionLevel
+from openhands.sdk.subagent.schema import AgentDefinition
 
 
 __all__ = [
@@ -22,7 +21,6 @@ __all__ = [
     "load_user_agents",
     "load_project_agents",
     "load_agents_from_dir",
-    "discover_agents",
     # agent registration
     "register_agent",
     "register_file_agents",
@@ -33,6 +31,5 @@ __all__ = [
     "get_registered_agent_definitions",
     # Agent def and factory
     "AgentDefinition",
-    "AgentDefinitionLevel",
     "agent_definition_to_factory",
 ]

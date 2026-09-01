@@ -3,6 +3,9 @@ on: [push, pull_request]
 jobs:
   unit:
     runs-on: ubuntu-latest
+    env:
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"
+      OPENHANDS_SUPPRESS_BANNER: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

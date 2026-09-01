@@ -9,7 +9,6 @@ from openhands.sdk.conversation.types import (
     ConversationID,
     ConversationTokenCallbackType,
     StuckDetectionThresholds,
-    TraceMetadataValue,
 )
 from openhands.sdk.conversation.visualizer import (
     ConversationVisualizerBase,
@@ -20,7 +19,6 @@ from openhands.sdk.logger import get_logger
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.secret import SecretValue
 from openhands.sdk.tool.client_tool import ClientToolSpec
-from openhands.sdk.utils.redact import redact_url_credentials
 from openhands.sdk.workspace import LocalWorkspace, RemoteWorkspace
 
 
@@ -85,9 +83,6 @@ class Conversation:
         tags: dict[str, str] | None = None,
         user_id: str | None = None,
         client_tools: list[ClientToolSpec] | None = None,
-        observability_metadata: dict[str, TraceMetadataValue] | None = None,
-        observability_tags: list[str] | None = None,
-        observability_span_name: str = "conversation",
     ) -> "LocalConversation": ...
 
     @overload
@@ -114,9 +109,6 @@ class Conversation:
         tags: dict[str, str] | None = None,
         user_id: str | None = None,
         client_tools: list[ClientToolSpec] | None = None,
-        observability_metadata: dict[str, TraceMetadataValue] | None = None,
-        observability_tags: list[str] | None = None,
-        observability_span_name: str = "conversation",
     ) -> "RemoteConversation": ...
 
     def __new__(
@@ -143,9 +135,6 @@ class Conversation:
         tags: dict[str, str] | None = None,
         user_id: str | None = None,
         client_tools: list[ClientToolSpec] | None = None,
-        observability_metadata: dict[str, TraceMetadataValue] | None = None,
-        observability_tags: list[str] | None = None,
-        observability_span_name: str = "conversation",
     ) -> BaseConversation:
         from openhands.sdk.conversation.impl.local_conversation import LocalConversation
         from openhands.sdk.conversation.impl.remote_conversation import (
@@ -175,12 +164,7 @@ class Conversation:
 
             # 2. Auto-generate plugins/skills tag from plugins parameter
             if plugins:
-                # tags persist verbatim — mask inline creds (${VAR} refs survive).
-                plugin_urls = [
-                    redact_url_credentials(url, preserve_placeholders=True)
-                    for p in plugins
-                    if (url := p.source_url)
-                ]
+                plugin_urls = [p.source_url for p in plugins if p.source_url]
                 if plugin_urls:
                     effective_tags["plugins"] = ",".join(plugin_urls)
                     logger.debug(f"Added plugins tag with {len(plugin_urls)} plugin(s)")
@@ -206,9 +190,6 @@ class Conversation:
                 tags=effective_tags if effective_tags else None,
                 user_id=user_id,
                 client_tools=client_tools,
-                observability_metadata=observability_metadata,
-                observability_tags=observability_tags,
-                observability_span_name=observability_span_name,
             )
 
         return LocalConversation(
@@ -229,7 +210,4 @@ class Conversation:
             tags=tags,
             user_id=user_id,
             client_tools=client_tools,
-            observability_metadata=observability_metadata,
-            observability_tags=observability_tags,
-            observability_span_name=observability_span_name,
         )

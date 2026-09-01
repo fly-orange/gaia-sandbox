@@ -1,41 +1,50 @@
-# Validation record — 2026-08-31
+# Validation record — 2026-09-01
 
-Environment: Windows, Python 3.12.13. Dependencies resolved into `uv.lock` and
-installed in this repository's `.venv`. SDK v1.44.1 is imported editable from
-`vendor/software-agent-sdk/openhands-sdk`, not a PyPI SDK copy.
+Environment: Windows, Python 3.12.13. The lockfile pins the same dependency
+versions as the selected OpenHands benchmark baseline, including OpenHands SDK/
+tools 1.27.0, LiteLLM 1.93.0 and browser-use 0.11.13.
 
-## Passed
+The local Windows environment could not finish building the LiteLLM 1.93.0 source
+distribution, so the test interpreter used LiteLLM 1.98.0 as a local-only
+workaround. `uv.lock` was not changed to that version. Linux CI and the Docker
+image continue to install the locked 1.93.0 version and are the authoritative
+dependency validation targets.
 
-- `python -m pytest -q`: **28 passed, 1 skipped**.
-- Real OpenHands SDK: two simultaneous conversations share the service PID,
-  invoke their own bound test sandbox, finish with answer `42`, and clean up.
-  The LLM completion boundary and Docker are simulated; SDK agent/event/tool
-  dispatch and lifecycle are real. No paid model requests are made by these tests.
-- Real SDK cancellation is classified as `timeout`, not a successful answer.
-- HTTP authentication and rejection of a ground-truth field in task requests.
-- Concurrency limit, exceptional cleanup, and cancellation while a Docker-create
-  worker is still running (no lost sandbox ownership).
-- GAIA numeric/string/list scoring, hidden test answers, attachment path validation.
-- End-to-end ASGI client → service → simulated sandbox → local scoring, plus
-  resume without accidentally advancing the sample limit and configuration mismatch checks.
+## Passed locally
+
+- `python -m pytest -q`: **36 passed, 1 skipped**.
+- Two simultaneous real SDK conversations share one service PID, receive separate
+  dynamically generated sandbox-tool proxies, produce answer `42`, and clean up.
+  LLM responses and Docker are simulated; SDK agent/event dispatch is real.
+- A real out-of-process tool worker initializes the pinned upstream Terminal,
+  FileEditor and TaskTracker, and Terminal executes a command successfully.
+- All 60 vendored public OpenHands skills parse successfully.
+- GAIA ordinary-file renaming, image-as-model-content behavior, safe ZIP expansion,
+  total attachment bounds, traversal rejection and no answer leakage.
+- Timeout classification, concurrency limit, authentication, cancellation during
+  container creation, cleanup, resume behavior and GAIA scoring.
 - `ruff check src tests`: passed.
-- Modified vendored SDK file: `ruff check --select E,F --ignore E501 .../agent/base.py` passed.
-- `uv lock --check --offline --cache-dir .uv-cache`: passed.
+- `ruff check --select E,F --ignore E501` on the three locally patched SDK files:
+  passed.
+- `uv lock --check --offline --cache-dir .uv-cache`: passed (357 packages).
 - `python -m gaia_shared.cli --config config.example.toml plan`: passed.
+- `git diff --check`, Python byte-compilation, nested `.git`/`.upstream` search and
+  repository secret-pattern scan: passed; only documented placeholder values exist.
 
-The suite emits 3 upstream SDK deprecation warnings about LiteLLM parameter
-modification; they do not fail the tests. The full upstream repository's pre-commit
-suite was not run: only the SDK package snapshot, not its full development workspace,
-is vendored here. The local patch has focused real-SDK regression coverage.
+The full upstream pre-commit workspace was not vendored, so its complete suite was
+not run. Local patches have targeted adapter regression coverage.
 
 ## Not validated on this host
 
-- Docker image build and real Linux Docker namespace/filesystem isolation.
-- Real vLLM requests, multimodal compatibility, or a real GAIA score.
-- GPU/DCGM measurements, hardware performance counters, or network egress policy.
-- Linux CI job (provided in `.github/workflows/tests.yml`, not yet run on GitHub).
+- Docker image build and Linux container isolation: Docker is not installed on this
+  Windows host. The opt-in Docker test now also starts the in-container worker and
+  verifies Terminal plus the browser-use tool schema.
+- Live Tavily MCP, Fetch MCP, Chromium navigation, vLLM requests, multimodal input,
+  a real GAIA score, GPU/DCGM measurements or egress policy.
+- The GitHub Linux CI result until this revision has been pushed.
 
-`tests/test_docker.py` is skipped unless `RUN_DOCKER_TESTS=1`. On the deployment
-host, build the image, run that test, then `doctor`, a one-question smoke run,
-and a two-question concurrent run. Compare `server_id/server_pid/container_id`
-and inspect container cleanup before accepting the platform for measurements.
+On the deployment host, build `gaia-sandbox:0.2`, run
+`RUN_DOCKER_TESTS=1 uv run pytest -m docker -q`, then `doctor`, one question, and
+two concurrent questions. Confirm one `server_id/server_pid`, distinct container
+IDs/tool-worker PIDs, expected tool names, successful cleanup, and usable Tavily/
+browser observations before accepting the platform for measurements.

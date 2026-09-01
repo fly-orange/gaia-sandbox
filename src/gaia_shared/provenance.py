@@ -7,6 +7,7 @@ def profile(cfg):
     return {
         "llm": cfg.llm,
         "sandbox": cfg.sandbox,
+        "agent": cfg.agent,
         "request_timeout": cfg.server["request_timeout"],
     }
 
@@ -22,7 +23,9 @@ def source_fingerprint(root: Path):
         digest.update(lockfile.read_bytes())
     for folder in (root / "src", root / "vendor"):
         for path in sorted(folder.rglob("*")):
-            if path.is_file() and path.suffix in (".py", ".j2", ".toml"):
+            if path.is_file() and "__pycache__" not in path.parts and not any(
+                part.endswith(".egg-info") for part in path.parts
+            ):
                 digest.update(path.relative_to(root).as_posix().encode())
                 digest.update(path.read_bytes())
     return digest.hexdigest()

@@ -16,7 +16,6 @@ from openhands.sdk.extensions.installation.metadata import (
 )
 from openhands.sdk.extensions.installation.utils import validate_extension_name
 from openhands.sdk.logger import get_logger
-from openhands.sdk.utils.redact import redact_url_credentials
 
 
 logger = get_logger(__name__)
@@ -84,7 +83,7 @@ class InstallationManager[T: ExtensionProtocol]:
         if isinstance(source, Path):
             source = str(source)
 
-        logger.info(f"Fetching extension from {redact_url_credentials(source)}")
+        logger.info(f"Fetching extension from {source}")
         fetched_path, resolved_ref = fetch_with_resolution(
             source=source,
             cache_dir=DEFAULT_CACHE_DIR,
@@ -115,7 +114,6 @@ class InstallationManager[T: ExtensionProtocol]:
             extension,
             source=source,
             install_path=install_path,
-            requested_ref=ref,
             resolved_ref=resolved_ref,
             repo_path=repo_path,
         )
@@ -316,8 +314,7 @@ class InstallationManager[T: ExtensionProtocol]:
             logger.warning(f"Extension {name} not installed")
             return None
 
-        redacted = redact_url_credentials(current_info.source)
-        logger.info(f"Updating extension {name} from {redacted}")
+        logger.info(f"Updating extension {name} from {current_info.source}")
         return self.install(
             source=current_info.source,
             ref=None,

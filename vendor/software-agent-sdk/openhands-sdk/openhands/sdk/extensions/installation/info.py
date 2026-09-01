@@ -22,13 +22,6 @@ class InstallationInfo(BaseModel):
     enabled: bool = Field(default=True, description="Whether the extension is enabled")
 
     source: str = Field(description="Original source (e.g., 'github:owner/repo')")
-    requested_ref: str | None = Field(
-        default=None,
-        description=(
-            "Branch, tag, or commit requested at install time. None means no "
-            "ref was requested (tracking the source's default branch)."
-        ),
-    )
     resolved_ref: str | None = Field(
         default=None, description="Resolved git commit SHA (for version pinning)"
     )
@@ -48,7 +41,6 @@ class InstallationInfo(BaseModel):
         extension: ExtensionProtocol,
         source: str,
         install_path: Path,
-        requested_ref: str | None = None,
         resolved_ref: str | None = None,
         repo_path: str | None = None,
     ) -> InstallationInfo:
@@ -58,8 +50,6 @@ class InstallationInfo(BaseModel):
             extension: Any object satisfying ``ExtensionProtocol``.
             source: Original source string (e.g. ``"github:owner/repo"``).
             install_path: Filesystem path the extension was copied to.
-            requested_ref: Branch, tag, or commit requested at install time,
-                if applicable.
             resolved_ref: Resolved git commit SHA, if applicable.
             repo_path: Subdirectory within a monorepo, if applicable.
         """
@@ -68,7 +58,6 @@ class InstallationInfo(BaseModel):
             version=extension.version,
             description=extension.description or "",
             source=source,
-            requested_ref=requested_ref,
             resolved_ref=resolved_ref,
             repo_path=repo_path,
             install_path=install_path,

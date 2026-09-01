@@ -2,13 +2,11 @@ import os
 import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
 
 from filelock import FileLock, Timeout
 
 from openhands.sdk.io.cache import MemoryLRUCache
 from openhands.sdk.logger import get_logger
-from openhands.sdk.utils.files import atomic_write_text
 from openhands.sdk.utils.path import to_posix_path
 
 from .base import FileStore
@@ -64,7 +62,8 @@ class LocalFileStore(FileStore):
         full_path = self.get_full_path(path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         if isinstance(contents, str):
-            atomic_write_text(Path(full_path), contents)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(contents)
             self.cache[full_path] = contents
         else:
             with open(full_path, "wb") as f:

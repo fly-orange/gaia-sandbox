@@ -1,24 +1,22 @@
 from __future__ import annotations
 
-import asyncio
 import copy
 import importlib
 import json
 import os
 import threading
 import warnings
-from collections.abc import AsyncIterable, Callable, Iterable, Mapping, Sequence
-from contextvars import ContextVar
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, get_args, get_origin
+from collections.abc import Callable, Sequence
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, get_args, get_origin
 
+import httpx  # noqa: F401
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     PrivateAttr,
     SecretStr,
-    computed_field,
     field_serializer,
     field_validator,
     model_validator,
@@ -27,17 +25,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from openhands.sdk.llm.fallback_strategy import FallbackStrategy
 from openhands.sdk.llm.utils.model_info import get_litellm_model_info
-from openhands.sdk.llm.utils.runtime_metadata import (
-    ModelRuntimeMetadata,
-    aresolve_provider_metadata,
-    cache_key as runtime_metadata_cache_key,
-    cached_metadata,
-    in_negative_cache,
-    resolve_provider_metadata_sync,
-    store_result,
-)
 from openhands.sdk.settings.metadata import SettingProminence, field_meta
-from openhands.sdk.utils.deprecation import warn_deprecated
 from openhands.sdk.utils.pydantic_secrets import serialize_secret, validate_secret
 
 
@@ -57,6 +45,7 @@ from typing import Final, cast
 
 from litellm import (
     ChatCompletionToolParam,
+    CustomStreamWrapper,
     ResponseInputParam,
     acompletion as litellm_acompletion,
     completion as litellm_completion,
@@ -71,6 +60,10 @@ from litellm.exceptions import (
 from litellm.responses.main import (
     aresponses as litellm_aresponses,
     responses as litellm_responses,
+)
+from litellm.responses.streaming_iterator import (
+    ResponsesAPIStreamingIterator,
+    SyncResponsesAPIStreamingIterator,
 )
 from litellm.types.llms.openai import (
     OutputTextDeltaEvent,
@@ -88,6 +81,7 @@ from litellm.types.utils import (
 )
 from litellm.utils import (
     create_pretrained_tokenizer,
+    supports_vision,
     token_counter,
 )
 
@@ -116,9 +110,9 @@ from openhands.sdk.llm.utils.image_inline import (
     maybe_inline_image_urls,
 )
 from openhands.sdk.llm.utils.image_resize import maybe_resize_messages_for_provider
-from openhands.sdk.llm.utils.litellm_provider import LLMProvider
+from openhands.sdk.llm.utils.litellm_provider import infer_litellm_provider
 from openhands.sdk.llm.utils.metrics import Metrics
-from openhands.sdk.llm.utils.model_features import ModelFeatures, get_features
+from openhands.sdk.llm.utils.model_features import get_features
 from openhands.sdk.llm.utils.openhands_provider import (
     LiteLLMCallKwargs,
     canonicalize_openhands_llm_payload,
@@ -126,17 +120,21 @@ from openhands.sdk.llm.utils.openhands_provider import (
 )
 from openhands.sdk.llm.utils.retry_mixin import RetryMixin
 from openhands.sdk.llm.utils.telemetry import Telemetry
-from openhands.sdk.llm.utils.vertex_preflight import assert_vertex_sdk_available
 from openhands.sdk.logger import ENV_LOG_DIR, get_logger
+from openhands.sdk.utils.deprecation import warn_deprecated
 
 
 logger = get_logger(__name__)
 
-litellm.modify_params = True
-
-_serialized_is_subscription = ContextVar(
-    "serialized_is_subscription",
-    default=False,
+# Shared message for the no-op ``_return_metrics`` deprecation (Q1 of #3341).
+# Metrics are always returned via ``LLMResponse.metrics``; the parameter has no
+# effect and is scheduled for removal after the standard 5-minor-release runway.
+# NOTE: ``deprecated_in`` / ``removed_in`` must be passed as string literals at
+# each call site — ``check_deprecations.py`` reads them via static AST analysis
+# and cannot resolve module-level constants.
+_RETURN_METRICS_DETAILS: Final[str] = (
+    "The _return_metrics parameter has no effect; metrics are always available "
+    "via LLMResponse.metrics. Stop passing it."
 )
 
 __all__ = ["LLM"]
@@ -166,23 +164,6 @@ ENV_ALLOW_SHORT_CONTEXT_WINDOWS: Final[str] = "ALLOW_SHORT_CONTEXT_WINDOWS"
 # 16384 is a safe default that works for most models (GPT-4o: 16k, Claude: 8k).
 DEFAULT_MAX_OUTPUT_TOKENS_CAP: Final[int] = 16384
 
-# Some providers (notably AWS Bedrock for Anthropic models) enforce
-# ``input_tokens + max_tokens <= context_window`` on a single shared window.
-# For these providers we clamp the per-request output budget at request time so
-# our injected default ``max_tokens`` (which defaults to the model's full
-# ``max_output_tokens`` -- e.g. 64k for Sonnet 4.5) cannot push large-input
-# requests past the context window. See BerriAI/litellm#17900 for the upstream
-# default change that made this manifest.
-JOINT_BUDGET_SAFETY_MARGIN_TOKENS: Final[int] = 256
-JOINT_BUDGET_MIN_OUTPUT_TOKENS: Final[int] = 1024
-# Provider name prefixes known to enforce a joint input/output token budget.
-# Kept as a narrow allowlist so direct providers (Anthropic, OpenAI, etc.) --
-# which have independent input/output windows -- are not affected. We match by
-# prefix because LiteLLM uses both ``bedrock`` (raw provider inference) and
-# ``bedrock_converse`` (the Anthropic-on-Bedrock route, surfaced via the model
-# registry) for the same underlying API.
-_JOINT_BUDGET_PROVIDER_PREFIXES: Final[tuple[str, ...]] = ("bedrock",)
-
 # Secret-bearing fields on LLM. Kept as a single source of truth so callers that
 # need to walk secrets (e.g. cipher-aware decryption on the save path) stay in
 # sync with the serializer below.
@@ -194,27 +175,6 @@ LLM_SECRET_FIELDS: Final[tuple[str, ...]] = (
 )
 
 LLM_PROFILE_SCHEMA_VERSION: Final[int] = 1
-
-
-@dataclass(frozen=True)
-class LLMCallContext:
-    """Per-conversation state threaded through the completion call chain.
-
-    The primary path threads this explicitly:
-    ``Agent.step()`` → ``make_llm_completion()`` → ``llm.completion(call_context=...)``
-    → ``select_chat_options(call_context=...)``.
-
-    A fallback copy is also stored as a ``PrivateAttr`` on :class:`LLM`
-    (via ``_bind_conversation_context``) for callers that don't thread
-    context explicitly (e.g. the condenser's dedicated LLM).  The
-    PrivateAttr is:
-    * dropped on ``model_dump()`` / ``model_validate()`` round-trips,
-    * shallow-copied by ``model_copy()`` (sub-agent),
-    * never serialised into user-visible config.
-    """
-
-    prompt_cache_key: str | None = None
-    session_id: str | None = None
 
 
 class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
@@ -262,33 +222,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             label="API Key",
         ),
     )
-    provider_connection_id: str | None = Field(
-        default=None,
-        description=(
-            "Optional provider connection whose shared API key and base URL "
-            "are resolved and applied each time this LLM profile is loaded "
-            "(read-at-use). When set, the profile stores no inline api_key or "
-            "base_url of its own."
-        ),
-        json_schema_extra=field_meta(SettingProminence.MAJOR),
-    )
-    auth_type: Literal["api_key", "subscription"] = Field(
-        default="api_key",
-        description="Authentication mode for the LLM.",
-        json_schema_extra=field_meta(
-            SettingProminence.CRITICAL,
-            label="Authentication",
-        ),
-    )
-    subscription_vendor: Literal["openai"] | None = Field(
-        default=None,
-        description="Subscription provider for subscription-backed LLM access.",
-        json_schema_extra=field_meta(
-            SettingProminence.CRITICAL,
-            label="Subscription provider",
-            depends_on=("auth_type",),
-        ),
-    )
     base_url: str | None = Field(
         default=None,
         description="Custom base URL.",
@@ -297,71 +230,56 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     api_version: str | None = Field(
         default=None,
         description="API version (e.g., Azure).",
-        json_schema_extra=field_meta(),
     )
 
     aws_access_key_id: str | SecretStr | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
     aws_secret_access_key: str | SecretStr | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
     aws_session_token: str | SecretStr | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
     aws_region_name: str | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
     aws_profile_name: str | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
     aws_role_name: str | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
     aws_session_name: str | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
     aws_bedrock_runtime_endpoint: str | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
 
-    # OpenRouter uses HTTP-Referer as the app identity for rankings.
-    # Keep this stable unless the OpenRouter app attribution is migrated.
     openrouter_site_url: str = Field(
         default="https://docs.all-hands.dev/",
-        json_schema_extra=field_meta(),
     )
     openrouter_app_name: str = Field(
         default="OpenHands",
-        json_schema_extra=field_meta(),
     )
 
-    num_retries: int = Field(default=5, ge=0, json_schema_extra=field_meta())
-    retry_multiplier: float = Field(default=8.0, ge=0, json_schema_extra=field_meta())
-    retry_min_wait: int = Field(default=8, ge=0, json_schema_extra=field_meta())
-    retry_max_wait: int = Field(default=64, ge=0, json_schema_extra=field_meta())
+    num_retries: int = Field(default=5, ge=0)
+    retry_multiplier: float = Field(default=8.0, ge=0)
+    retry_min_wait: int = Field(default=8, ge=0)
+    retry_max_wait: int = Field(default=64, ge=0)
 
     timeout: int | None = Field(
         default=300,
         ge=0,
         description="HTTP timeout in seconds. Default is 300s (5 minutes). "
         "Set to None to disable timeout (not recommended for production).",
-        json_schema_extra=field_meta(),
     )
 
     max_message_chars: int = Field(
         default=30_000,
         ge=1,
         description="Approx max chars in each event/content sent to the LLM.",
-        json_schema_extra=field_meta(),
     )
 
     temperature: float | None = Field(
@@ -373,7 +291,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "Set to 0.0 for deterministic outputs, "
             "or higher values (0.7-1.0) for more creative responses."
         ),
-        json_schema_extra=field_meta(),
     )
     top_p: float | None = Field(
         default=None,
@@ -384,9 +301,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "Defaults to None (uses provider default). "
             "Set to a value between 0 and 1 to control diversity of outputs."
         ),
-        json_schema_extra=field_meta(),
     )
-    top_k: float | None = Field(default=None, ge=0, json_schema_extra=field_meta())
+    top_k: float | None = Field(default=None, ge=0)
 
     max_input_tokens: int | None = Field(
         default=None,
@@ -394,13 +310,11 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         description="The maximum number of input tokens. "
         "Note that this is currently unused, and the value at runtime is actually"
         " the total tokens in OpenAI (e.g. 128,000 tokens for GPT-4).",
-        json_schema_extra=field_meta(),
     )
     max_output_tokens: int | None = Field(
         default=None,
         ge=1,
         description="The maximum number of output tokens. This is sent to the LLM.",
-        json_schema_extra=field_meta(),
     )
     model_canonical_name: str | None = Field(
         default=None,
@@ -414,49 +328,23 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "capability detection. If not provided, the 'model' field "
             "will be used for capability lookups."
         ),
-        json_schema_extra=field_meta(),
-    )
-    api_mode: Literal["auto", "chat", "responses"] = Field(
-        default="auto",
-        description=(
-            "LLM API endpoint mode. 'auto' resolves from model metadata and "
-            "SDK fallbacks; use 'chat' or 'responses' to override endpoint "
-            "selection for proxy aliases and newly released models."
-        ),
-        json_schema_extra=field_meta(),
-    )
-    capability_overrides: dict[str, bool | str] = Field(
-        default_factory=dict,
-        description=(
-            "Explicit model capability overrides. Supported keys include "
-            "supports_reasoning_effort, thinking_mode (adaptive, manual, none, "
-            "or unknown), supports_sampling_params, supports_prompt_cache, "
-            "supports_stop_words, supports_responses_api, supports_vision, and "
-            "supports_prompt_cache_retention. Overrides take precedence over "
-            "LiteLLM metadata and SDK fallbacks."
-        ),
-        json_schema_extra=field_meta(),
     )
     extra_headers: dict[str, str] | None = Field(
         default=None,
         description="Optional HTTP headers to forward to LiteLLM requests.",
-        json_schema_extra=field_meta(),
     )
     input_cost_per_token: float | None = Field(
         default=None,
         ge=0,
         description="The cost per input token. This will available in logs for user.",
-        json_schema_extra=field_meta(),
     )
     output_cost_per_token: float | None = Field(
         default=None,
         ge=0,
         description="The cost per output token. This will available in logs for user.",
-        json_schema_extra=field_meta(),
     )
     ollama_base_url: str | None = Field(
         default=None,
-        json_schema_extra=field_meta(),
     )
 
     stream: bool = Field(
@@ -466,58 +354,42 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "When enabled, the provided `on_token` callback in .completions "
             "and .responses will be invoked for each chunk of tokens."
         ),
-        json_schema_extra=field_meta(),
     )
-    drop_params: bool = Field(default=True, json_schema_extra=field_meta())
+    drop_params: bool = Field(default=True)
     modify_params: bool = Field(
         default=True,
-        description=(
-            "Compatibility field. LiteLLM parameter modification is enabled "
-            "process-wide so concurrent LLM calls do not mutate shared global state."
-        ),
-        deprecated=(
-            "Deprecated since v1.42.0 and scheduled for removal in v1.47.0. "
-            "LiteLLM parameter modification is enabled process-wide; remove this "
-            "argument."
-        ),
-        json_schema_extra=field_meta(),
+        description="Modify params allows litellm to do transformations like adding"
+        " a default message, when a message is empty.",
     )
     disable_vision: bool | None = Field(
         default=None,
         description="If model is vision capable, this option allows to disable image "
         "processing (useful for cost reduction).",
-        json_schema_extra=field_meta(),
     )
     disable_stop_word: bool | None = Field(
         default=False,
         description="Disable using of stop word.",
-        json_schema_extra=field_meta(),
     )
     caching_prompt: bool = Field(
         default=True,
         description="Enable caching of prompts.",
-        json_schema_extra=field_meta(),
     )
     log_completions: bool = Field(
         default=False,
         description="Enable logging of completions.",
-        json_schema_extra=field_meta(),
     )
     log_completions_folder: str = Field(
         default=os.path.join(ENV_LOG_DIR, "completions"),
         description="The folder to log LLM completions to. "
         "Required if log_completions is True.",
-        json_schema_extra=field_meta(),
     )
     custom_tokenizer: str | None = Field(
         default=None,
         description="A custom tokenizer to use for token counting.",
-        json_schema_extra=field_meta(),
     )
     native_tool_calling: bool = Field(
         default=True,
         description="Whether to use native tool calling.",
-        json_schema_extra=field_meta(),
     )
     force_string_serializer: bool | None = Field(
         default=None,
@@ -527,7 +399,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "Useful for providers that do not support list content, "
             "like HuggingFace and Groq."
         ),
-        json_schema_extra=field_meta(),
     )
     inline_image_urls: bool | None = Field(
         default=None,
@@ -540,34 +411,28 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "reached through a proxy alias that hides the underlying "
             "provider (e.g. ``litellm_proxy/<custom-alias>``). Note: "
             "inlining only runs when ``vision_is_active()`` is True, so "
-            "the alias must still be recognised as vision-capable by the "
-            "SDK feature registry or proxy model metadata."
+            "the alias must still be recognised as vision-capable by "
+            "litellm — otherwise images are not sent at all and there is "
+            "nothing to inline."
         ),
-        json_schema_extra=field_meta(),
     )
-    reasoning_effort: (
-        Literal["low", "medium", "high", "xhigh", "none"] | SkipJsonSchema[str] | None
-    ) = Field(
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "none"] | None = Field(
         default="high",
-        description=(
-            "Provider-neutral reasoning effort. Common values include 'none', "
-            "'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'. The SDK "
-            "accepts future provider values and lets LiteLLM translate them."
-        ),
-        json_schema_extra=field_meta(),
+        description="The effort to put into reasoning. "
+        "This is a string that can be one of 'low', 'medium', 'high', 'xhigh', "
+        "or 'none'. "
+        "Can apply to all reasoning models.",
     )
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = Field(
         default=None,
         description="The level of detail for reasoning summaries. "
         "This is a string that can be one of 'auto', 'concise', or 'detailed'. "
         "Requires verified OpenAI organization. Only sent when explicitly set.",
-        json_schema_extra=field_meta(),
     )
     enable_encrypted_reasoning: bool = Field(
         default=True,
         description="If True, ask for ['reasoning.encrypted_content'] "
         "in Responses API include.",
-        json_schema_extra=field_meta(),
     )
     # Prompt cache retention is filtered per model features in chat options.
     prompt_cache_retention: str | None = Field(
@@ -577,21 +442,15 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "(GPT-5+ and GPT-4.1, excluding Azure deployments); explicitly "
             "stripped for all others."
         ),
-        json_schema_extra=field_meta(),
     )
     extended_thinking_budget: int | None = Field(
         default=200_000,
-        description=(
-            "Legacy token budget for models confirmed to use manual Anthropic "
-            "extended thinking. Ignored for adaptive-thinking models. Prefer "
-            "reasoning_effort for new integrations."
-        ),
-        json_schema_extra=field_meta(),
+        description="The budget tokens for extended thinking, "
+        "supported by Anthropic models.",
     )
     seed: int | None = Field(
         default=None,
         description="The seed to use for random number generation.",
-        json_schema_extra=field_meta(),
     )
     usage_id: str = Field(
         default="default",
@@ -600,7 +459,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "Unique usage identifier for the LLM. Used for registry lookups, "
             "telemetry, and spend tracking."
         ),
-        json_schema_extra=field_meta(),
     )
     litellm_extra_body: dict[str, Any] = Field(
         default_factory=dict,
@@ -618,7 +476,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             "- Proxy routing: {'trace_version': '1.0.0', 'tags': ['agent:my-agent']} "
             "- vLLM features: {'return_token_ids': True}"
         ),
-        json_schema_extra=field_meta(),
     )
 
     fallback_strategy: FallbackStrategy | None = Field(
@@ -647,32 +504,12 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     _chat_template_tokenizer: Any = PrivateAttr(default=None)
     _telemetry: Telemetry | None = PrivateAttr(default=None)
     _is_subscription: bool = PrivateAttr(default=False)
-    _subscription_credential_store: Any = PrivateAttr(default=None)
-    _subscription_credentials: Any = PrivateAttr(default=None)
-    _provider_info: LLMProvider | None = PrivateAttr(default=None)
-    _call_context: LLMCallContext = PrivateAttr(default_factory=LLMCallContext)
+    _litellm_provider: str | None = PrivateAttr(default=None)
+    _prompt_cache_key: str | None = PrivateAttr(default=None)
     _effective_max_input_tokens: int | None = PrivateAttr(default=None)
     _effective_max_output_tokens: int | None = PrivateAttr(default=None)
-    # Provider-aware runtime metadata resolved lazily (see
-    # `utils/runtime_metadata.py`). `fetched_at` and `negative_until` are
-    # monotonic timestamps used for the positive/negative caches;
-    # `generation` is bumped each time a lookup is *started* so that a stale
-    # (earlier-started, later-finished) probe can never overwrite the result
-    # of a newer one (single-flight by generation, see `resolve_runtime_metadata`).
-    _runtime_metadata: ModelRuntimeMetadata | None = PrivateAttr(default=None)
-    _runtime_metadata_fetched_at: float | None = PrivateAttr(default=None)
-    _runtime_metadata_negative_until: float | None = PrivateAttr(default=None)
-    _runtime_metadata_key: tuple[str, str, str] | None = PrivateAttr(default=None)
-    # Single-flight / stale-proofing for runtime-metadata resolution. Each
-    # *started* lookup records the generation it belongs to (see above); a
-    # completed probe only publishes its result if that generation is still the
-    # latest, so a slow earlier-started probe can never overwrite a newer one.
-    _runtime_metadata_generation: int = PrivateAttr(default=0)
-    # Guards the runtime-metadata cache fields above. The synchronous resolver
-    # may be driven from a worker thread, and the async resolver can also store
-    # a result, so the read/check and store are kept atomic. ClassVar (shared);
-    # critical sections are tiny and never cover network I/O.
-    _runtime_metadata_lock: ClassVar[threading.Lock] = threading.Lock()
+    _litellm_modify_params_lock: ClassVar[threading.RLock] = threading.RLock()
+
     model_config: ClassVar[ConfigDict] = ConfigDict(
         extra="ignore", arbitrary_types_allowed=True
     )
@@ -680,13 +517,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     # =========================================================================
     # Validators
     # =========================================================================
-    @model_validator(mode="before")
-    @classmethod
-    def _capture_serialized_is_subscription(cls, data):
-        if isinstance(data, dict):
-            _serialized_is_subscription.set(bool(data.get("is_subscription")))
-        return data
-
     @field_validator(
         "api_key", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"
     )
@@ -700,18 +530,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         if not isinstance(data, dict):
             return data
         d = dict(data)
-
-        if "modify_params" in d:
-            warn_deprecated(
-                "LLM.modify_params",
-                deprecated_in="1.42.0",
-                removed_in="1.47.0",
-                details=(
-                    "LiteLLM parameter modification is enabled process-wide; "
-                    "remove this argument."
-                ),
-                stacklevel=3,
-            )
 
         model_val = d.get("model")
         if not model_val:
@@ -773,7 +591,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     )
                     self._tokenizer = None
 
-        self._refresh_litellm_metadata()
+        # Capabilities + model info
+        self._init_model_info_and_caps()
 
         logger.debug(
             f"LLM ready: model={self.model} base_url={self.base_url} "
@@ -781,31 +600,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             f"temperature={self.temperature}"
         )
         return self
-
-    def _refresh_litellm_metadata(self) -> None:
-        call_kwargs = self._litellm_call_kwargs()
-        self._provider_info = LLMProvider.from_model(
-            model=call_kwargs["model"],
-            api_base=call_kwargs["api_base"],
-        )
-        self._init_model_info_and_caps()
-
-    def model_copy(
-        self,
-        *,
-        update: Mapping[str, Any] | None = None,
-        deep: bool = False,
-    ) -> Self:
-        # Pydantic copies private attrs without re-running validators, even for
-        # deep copies, so routing-field updates must rebuild derived metadata.
-        copied = super().model_copy(update=update, deep=deep)
-        route_changed = update is not None and any(
-            k in update for k in ("model", "base_url", "litellm_extra_body")
-        )
-        if route_changed:
-            copied._refresh_litellm_metadata()
-            copied._reset_runtime_metadata_for_key()
-        return copied
 
     def _openrouter_headers(self) -> dict[str, str]:
         """Build OpenRouter HTTP-Referer / X-Title headers for per-call use.
@@ -907,44 +701,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             )
         return self._telemetry
 
-    @computed_field(
-        return_type=bool,
-        description=(
-            "Whether this LLM uses subscription-based authentication. "
-            "Serialized so that subscription-specific request handling "
-            "survives transport to a remote agent-server."
-        ),
-    )
     @property
     def is_subscription(self) -> bool:
-        """Check if this LLM uses subscription-based authentication."""
-        return self._is_subscription
+        """Check if this LLM uses subscription-based authentication.
 
-    @is_subscription.setter
-    def is_subscription(self, value: bool) -> None:
-        self._is_subscription = value
+        Returns True when the LLM was created via `LLM.subscription_login()`,
+        which uses the ChatGPT subscription Codex backend rather than the
+        standard OpenAI API.
 
-    @property
-    def requires_streaming(self) -> bool:
-        """Whether the provider requires stream=True for all requests.
-
-        Set when the underlying endpoint rejects non-streaming requests;
-        callers must leave streaming enabled and must not require an
-        on_token callback because the response is drained internally.
+        Returns:
+            bool: True if using subscription-based transport, False otherwise.
         """
         return self._is_subscription
-
-    @model_validator(mode="wrap")
-    @classmethod
-    def _restore_is_subscription(cls, data, handler):
-        token = _serialized_is_subscription.set(False)
-        try:
-            llm = handler(data)
-            if _serialized_is_subscription.get():
-                llm._is_subscription = True
-            return llm
-        finally:
-            _serialized_is_subscription.reset(token)
 
     def restore_metrics(self, metrics: Metrics) -> None:
         # Only used by ConversationStats to seed metrics
@@ -964,19 +732,11 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         When an LLM is copied (e.g., to create a condenser LLM from an agent LLM),
         Pydantic's model_copy() does a shallow copy of private attributes by default,
         causing the original and copied LLM to share the same Metrics object.
-        This method allows the registry to fix this by creating fresh metrics and
-        telemetry immediately, so the copied LLM is ready for the next completion
-        call even if callers do not access ``metrics``/``telemetry`` first.
+        This method allows the registry to fix this by resetting metrics to None,
+        which will be lazily recreated when accessed.
         """
-        self._metrics = Metrics(model_name=self.model)
-        self._telemetry = Telemetry(
-            model_name=self.model,
-            log_enabled=self.log_completions,
-            log_dir=self.log_completions_folder if self.log_completions else None,
-            input_cost_per_token=self.input_cost_per_token,
-            output_cost_per_token=self.output_cost_per_token,
-            metrics=self._metrics,
-        )
+        self._metrics = None
+        self._telemetry = None
 
     def _handle_error(
         self,
@@ -1016,6 +776,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         offloaded to a thread via :func:`asyncio.loop.run_in_executor` to
         avoid blocking the event loop.
         """
+        import asyncio
+
         assert self._telemetry is not None
         self._telemetry.on_error(error)
         if self.fallback_strategy and self.fallback_strategy.should_fallback(error):
@@ -1078,31 +840,17 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         instructions: str | None,
         resp_tools: list[Any] | None,
         final_kwargs: dict[str, Any],
-        auth_values: tuple[str | None, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Build the shared kwargs dict for litellm_responses / litellm_aresponses."""
         typed_input: ResponseInputParam | str = (
             cast(ResponseInputParam, input_items) if input_items else ""
         )
-        provider_info = self._provider_info
-        assert provider_info is not None
-        api_key_value, subscription_headers = (
-            auth_values if auth_values is not None else self._get_litellm_auth_values()
-        )
-        if subscription_headers:
-            final_kwargs = {
-                **final_kwargs,
-                "extra_headers": {
-                    **(final_kwargs.get("extra_headers") or {}),
-                    **subscription_headers,
-                },
-            }
         return {
-            **provider_info.as_litellm_call_kwargs(api_key=api_key_value),
+            **self._litellm_call_kwargs(),
             "input": typed_input,
             "instructions": instructions,
             "tools": resp_tools,
-            "api_base": provider_info.api_base,
+            "api_key": self._get_litellm_api_key_value(),
             "api_version": self.api_version,
             "timeout": self.timeout,
             "drop_params": self.drop_params,
@@ -1176,10 +924,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             completed_resp.output = collected_output_items
 
         assert self._telemetry is not None
-        self._telemetry.on_response(
-            completed_resp,
-            provider_info=self._provider_info,
-        )
+        self._telemetry.on_response(completed_resp)
         return completed_resp
 
     def _prepare_completion_params(
@@ -1188,7 +933,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         tools: Sequence[ToolDefinition] | None,
         add_security_risk_prediction: bool,
         kwargs: dict[str, Any],
-        call_context: LLMCallContext | None = None,
     ) -> tuple[
         list[dict[str, Any]],
         list[ChatCompletionToolParam],
@@ -1204,11 +948,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         """
         formatted_messages = self.format_messages_for_llm(messages)
         return self._finalize_completion_params(
-            formatted_messages,
-            tools,
-            add_security_risk_prediction,
-            kwargs,
-            call_context=call_context,
+            formatted_messages, tools, add_security_risk_prediction, kwargs
         )
 
     async def _aprepare_completion_params(
@@ -1217,7 +957,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         tools: Sequence[ToolDefinition] | None,
         add_security_risk_prediction: bool,
         kwargs: dict[str, Any],
-        call_context: LLMCallContext | None = None,
     ) -> tuple[
         list[dict[str, Any]],
         list[ChatCompletionToolParam],
@@ -1233,11 +972,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         """
         formatted_messages = await self.aformat_messages_for_llm(messages)
         return self._finalize_completion_params(
-            formatted_messages,
-            tools,
-            add_security_risk_prediction,
-            kwargs,
-            call_context=call_context,
+            formatted_messages, tools, add_security_risk_prediction, kwargs
         )
 
     def _finalize_completion_params(
@@ -1246,7 +981,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         tools: Sequence[ToolDefinition] | None,
         add_security_risk_prediction: bool,
         kwargs: dict[str, Any],
-        call_context: LLMCallContext | None = None,
     ) -> tuple[
         list[dict[str, Any]],
         list[ChatCompletionToolParam],
@@ -1296,25 +1030,16 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         kwargs["tools"] = cc_tools if (bool(cc_tools) and use_native_fc) else None
         has_tools_flag = bool(cc_tools) and use_native_fc
         # Behavior-preserving: delegate to select_chat_options
-        call_kwargs = select_chat_options(
-            self, kwargs, has_tools=has_tools_flag, call_context=call_context
-        )
-
-        # 3a) joint input/output budget clamp (e.g. Bedrock-Anthropic)
-        call_kwargs = self._clamp_max_tokens_for_joint_budget(
-            call_kwargs,
-            formatted_messages,
-            [] if use_mock_tools else cc_tools,
-        )
+        call_kwargs = select_chat_options(self, kwargs, has_tools=has_tools_flag)
 
         # 4) request context for telemetry (always include context_window for metrics)
         # Always pass context_window so metrics are tracked even when
         # logging is disabled.
-        telemetry = self.telemetry
+        assert self._telemetry is not None
         telemetry_ctx: dict[str, Any] = {
             "context_window": self.effective_max_input_tokens or 0
         }
-        if telemetry.log_enabled:
+        if self._telemetry.log_enabled:
             telemetry_ctx.update(
                 {
                     "messages": formatted_messages[:],  # already simple dicts
@@ -1341,7 +1066,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         store: bool | None,
         add_security_risk_prediction: bool,
         kwargs: dict[str, Any],
-        call_context: LLMCallContext | None = None,
     ) -> tuple[
         str | None,
         list[dict[str, Any]],
@@ -1364,7 +1088,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             store,
             add_security_risk_prediction,
             kwargs,
-            call_context=call_context,
         )
 
     async def _aprepare_responses_params(
@@ -1375,7 +1098,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         store: bool | None,
         add_security_risk_prediction: bool,
         kwargs: dict[str, Any],
-        call_context: LLMCallContext | None = None,
     ) -> tuple[
         str | None,
         list[dict[str, Any]],
@@ -1397,7 +1119,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             store,
             add_security_risk_prediction,
             kwargs,
-            call_context=call_context,
         )
 
     def _finalize_responses_params(
@@ -1409,7 +1130,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         store: bool | None,
         add_security_risk_prediction: bool,
         kwargs: dict[str, Any],
-        call_context: LLMCallContext | None = None,
     ) -> tuple[
         str | None,
         list[dict[str, Any]],
@@ -1440,17 +1160,17 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
 
         # Normalize/override Responses kwargs consistently
         call_kwargs = select_responses_options(
-            self, kwargs, include=include, store=store, call_context=call_context
+            self, kwargs, include=include, store=store
         )
 
         # Request context for telemetry (always include context_window for metrics)
         # Always pass context_window so metrics are tracked even when
         # logging is disabled.
-        telemetry = self.telemetry
+        assert self._telemetry is not None
         telemetry_ctx: dict[str, Any] = {
             "context_window": self.effective_max_input_tokens or 0
         }
-        if telemetry.log_enabled:
+        if self._telemetry.log_enabled:
             telemetry_ctx.update(
                 {
                     "llm_path": "responses",
@@ -1494,11 +1214,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
 
         # 6) telemetry
         assert self._telemetry is not None
-        self._telemetry.on_response(
-            resp,
-            raw_resp=raw_resp,
-            provider_info=self._provider_info,
-        )
+        self._telemetry.on_response(resp, raw_resp=raw_resp)
 
         # Ensure at least one choice.
         # Gemini sometimes returns empty choices; we raise LLMNoResponseError here
@@ -1517,9 +1233,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         self,
         messages: list[Message],
         tools: Sequence[ToolDefinition] | None = None,
+        _return_metrics: bool = False,
         add_security_risk_prediction: bool = False,
         on_token: TokenCallbackType | None = None,
-        call_context: LLMCallContext | None = None,
         **kwargs,
     ) -> LLMResponse:
         """Generate a completion from the language model.
@@ -1530,6 +1246,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         Args:
             messages: List of conversation messages.
             tools: Optional list of tools available to the model.
+            _return_metrics: Deprecated and ignored; metrics are always returned
+                via ``LLMResponse.metrics``. Scheduled for removal in
+                ``1.29.0``.
             add_security_risk_prediction: Add security_risk field to tool schemas.
             on_token: Optional callback for streaming tokens.
             **kwargs: Additional arguments passed to the LLM API.
@@ -1540,27 +1259,31 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         Note:
             Summary field is always added to tool schemas for transparency and
             explainability of agent actions.
-        """
-        # Resolve provider-aware runtime metadata (e.g. OpenRouter route limits)
-        # before the first completion so ``effective_max_input_tokens`` /
-        # ``effective_max_output_tokens`` reflect the actual runtime route for
-        # any context management that runs later in this call. The result is
-        # cached (1h TTL) and negative-cached on failure, and the probe is a
-        # no-op for providers without runtime metadata.
-        self.resolve_runtime_metadata()
 
+        Raises:
+            ValueError: If streaming is requested (not supported).
+
+        Example:
+            ```python
+            from openhands.sdk.llm import Message, TextContent
+
+            messages = [Message(role="user", content=[TextContent(text="Hello")])]
+            response = llm.completion(messages)
+            print(response.content)
+            ```
+        """
+        if _return_metrics:
+            warn_deprecated(
+                "LLM.completion(_return_metrics=...)",
+                deprecated_in="1.24.0",
+                removed_in="1.29.0",
+                details=_RETURN_METRICS_DETAILS,
+            )
         _caller_kwargs = kwargs.copy()
         enable_streaming = bool(kwargs.get("stream", False)) or self.stream
-        if enable_streaming and on_token is None:
-            # Gracefully degrade to non-streaming rather than crashing a run when
-            # streaming is requested without a callback wired. See #4014.
-            logger.debug(
-                "Streaming requested without an on_token callback; "
-                "falling back to a non-streaming completion."
-            )
-            enable_streaming = False
-            kwargs.pop("stream", None)
-        elif enable_streaming:
+        if enable_streaming:
+            if on_token is None:
+                raise ValueError("Streaming requires an on_token callback")
             kwargs["stream"] = True
 
         (
@@ -1570,11 +1293,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_kwargs,
             telemetry_ctx,
         ) = self._prepare_completion_params(
-            messages,
-            tools,
-            add_security_risk_prediction,
-            kwargs,
-            call_context=call_context,
+            messages, tools, add_security_risk_prediction, kwargs
         )
 
         @self._make_retry_decorator()
@@ -1623,7 +1342,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     tools,
                     add_security_risk_prediction=add_security_risk_prediction,
                     on_token=on_token,
-                    call_context=call_context,
                     **_caller_kwargs,
                 ),
             )
@@ -1635,9 +1353,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         self,
         messages: list[Message],
         tools: Sequence[ToolDefinition] | None = None,
+        _return_metrics: bool = False,
         add_security_risk_prediction: bool = False,
         on_token: AnyTokenCallbackType | None = None,
-        call_context: LLMCallContext | None = None,
         **kwargs,
     ) -> LLMResponse:
         """Async variant of :meth:`completion`.
@@ -1645,26 +1363,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         Uses ``litellm.acompletion`` under the hood, freeing the event loop
         while waiting for the LLM provider response.
         """
-        # Resolve provider-aware runtime metadata (e.g. OpenRouter route limits)
-        # before the first completion on the agent-server async path so
-        # ``effective_max_input_tokens`` reflects the actual runtime route.
-        # The result is cached (1h TTL) and negative-cached on failure, and the
-        # probe is a no-op for providers without runtime metadata, so repeated
-        # calls are cheap.
-        await self.aresolve_runtime_metadata()
-
+        if _return_metrics:
+            warn_deprecated(
+                "LLM.acompletion(_return_metrics=...)",
+                deprecated_in="1.24.0",
+                removed_in="1.29.0",
+                details=_RETURN_METRICS_DETAILS,
+            )
         _caller_kwargs = kwargs.copy()
         enable_streaming = bool(kwargs.get("stream", False)) or self.stream
-        if enable_streaming and on_token is None:
-            # Gracefully degrade to non-streaming rather than crashing a run when
-            # streaming is requested without a callback wired. See #4014.
-            logger.debug(
-                "Streaming requested without an on_token callback; "
-                "falling back to a non-streaming completion."
-            )
-            enable_streaming = False
-            kwargs.pop("stream", None)
-        elif enable_streaming:
+        if enable_streaming:
+            if on_token is None:
+                raise ValueError("Streaming requires an on_token callback")
             kwargs["stream"] = True
 
         (
@@ -1674,11 +1384,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_kwargs,
             telemetry_ctx,
         ) = await self._aprepare_completion_params(
-            messages,
-            tools,
-            add_security_risk_prediction,
-            kwargs,
-            call_context=call_context,
+            messages, tools, add_security_risk_prediction, kwargs
         )
 
         @self._make_retry_decorator()
@@ -1730,7 +1436,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     tools,
                     add_security_risk_prediction=add_security_risk_prediction,
                     on_token=_fb_token,
-                    call_context=call_context,
                     **_caller_kwargs,
                 ),
             )
@@ -1744,9 +1449,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         tools: Sequence[ToolDefinition] | None = None,
         include: list[str] | None = None,
         store: bool | None = None,
+        _return_metrics: bool = False,
         add_security_risk_prediction: bool = False,
         on_token: TokenCallbackType | None = None,
-        call_context: LLMCallContext | None = None,
         **kwargs,
     ) -> LLMResponse:
         """Alternative invocation path using OpenAI Responses API via LiteLLM.
@@ -1758,6 +1463,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             tools: Optional list of tools available to the model
             include: Optional list of fields to include in response
             store: Whether to store the conversation
+            _return_metrics: Deprecated and ignored; metrics are always returned
+                via ``LLMResponse.metrics``. Scheduled for removal in ``1.29.0``.
             add_security_risk_prediction: Add security_risk field to tool schemas
             on_token: Optional callback for streaming deltas
             **kwargs: Additional arguments passed to the API
@@ -1766,27 +1473,19 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             Summary field is always added to tool schemas for transparency and
             explainability of agent actions.
         """
-        # Resolve provider-aware runtime metadata before the first request so
-        # ``effective_max_input_tokens`` / ``effective_max_output_tokens``
-        # reflect the actual runtime route during subsequent context management.
-        # Cached (1h TTL) / negative-cached; no-op for providers without runtime
-        # metadata.
-        self.resolve_runtime_metadata()
-
+        if _return_metrics:
+            warn_deprecated(
+                "LLM.responses(_return_metrics=...)",
+                deprecated_in="1.24.0",
+                removed_in="1.29.0",
+                details=_RETURN_METRICS_DETAILS,
+            )
         _caller_kwargs = kwargs.copy()
         user_enable_streaming = bool(kwargs.get("stream", False)) or self.stream
-        if user_enable_streaming and on_token is None and not self.requires_streaming:
-            # Gracefully degrade to non-streaming rather than crashing a run when
-            # streaming is requested without a callback wired. Providers that
-            # require streaming are exempt — they drain the stream internally
-            # without an on_token callback. See requires_streaming and #4014.
-            logger.debug(
-                "Streaming requested without an on_token callback; "
-                "falling back to a non-streaming responses call."
-            )
-            user_enable_streaming = False
-            kwargs.pop("stream", None)
-        elif user_enable_streaming:
+        if user_enable_streaming:
+            # We allow on_token to be None for subscription mode
+            if on_token is None and not self.is_subscription:
+                raise ValueError("Streaming requires an on_token callback")
             kwargs["stream"] = True
 
         (
@@ -1796,13 +1495,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_kwargs,
             telemetry_ctx,
         ) = self._prepare_responses_params(
-            messages,
-            tools,
-            include,
-            store,
-            add_security_risk_prediction,
-            kwargs,
-            call_context=call_context,
+            messages, tools, include, store, add_security_risk_prediction, kwargs
         )
 
         @self._make_retry_decorator()
@@ -1810,60 +1503,58 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             assert self._telemetry is not None
             self._telemetry.on_request(telemetry_ctx=telemetry_ctx)
             final_kwargs = {**call_kwargs, **retry_kwargs}
-            litellm_kwargs = self._build_responses_call_kwargs(
-                input_items, instructions, resp_tools, final_kwargs
-            )
-            ret = litellm_responses(**litellm_kwargs)
-
-            if isinstance(ret, ResponsesAPIResponse):
-                if user_enable_streaming:
-                    logger.warning(
-                        "Responses streaming was requested, but the "
-                        "provider returned a non-streaming response; "
-                        "no on_token deltas will be emitted."
+            with self._litellm_modify_params_ctx(self.modify_params):
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning)
+                    litellm_kwargs = self._build_responses_call_kwargs(
+                        input_items, instructions, resp_tools, final_kwargs
                     )
-                self._telemetry.on_response(
-                    ret,
-                    provider_info=self._provider_info,
-                )
-                return ret
+                    ret = litellm_responses(**litellm_kwargs)
 
-            # When stream=True, LiteLLM returns a streaming
-            # iterator rather than a single ResponsesAPIResponse.
-            # Third-party wrappers may replace LiteLLM's concrete
-            # iterator with another iterable, so drain by protocol.
-            if final_kwargs.get("stream", False):
-                stream_callback = on_token if user_enable_streaming else None
-                # Collect output items from streaming events.
-                # Some endpoints (e.g., Codex subscription) send
-                # output items as separate events but the final
-                # response.completed event has output=[].  We
-                # accumulate them here and patch the completed
-                # response if needed.
-                collected_output_items: list[Any] = []
-                completed_response = getattr(ret, "completed_response", None)
-                stream = cast(Iterable[Any], ret)
-                for event in stream:
-                    if event is None:
-                        continue
-                    if isinstance(event, ResponseCompletedEvent):
-                        completed_response = event
-                    output_item, delta_chunk = self._process_stream_event(
-                        event, emit_deltas=stream_callback is not None
+                    if isinstance(ret, ResponsesAPIResponse):
+                        if user_enable_streaming:
+                            logger.warning(
+                                "Responses streaming was requested, but the "
+                                "provider returned a non-streaming response; "
+                                "no on_token deltas will be emitted."
+                            )
+                        self._telemetry.on_response(ret)
+                        return ret
+
+                    # When stream=True, LiteLLM returns a streaming
+                    # iterator rather than a single ResponsesAPIResponse.
+                    # Drain the iterator and use the completed response.
+                    if final_kwargs.get("stream", False):
+                        if not isinstance(ret, SyncResponsesAPIStreamingIterator):
+                            raise AssertionError(
+                                f"Expected Responses stream iterator, got {type(ret)}"
+                            )
+                        stream_callback = on_token if user_enable_streaming else None
+                        # Collect output items from streaming events.
+                        # Some endpoints (e.g., Codex subscription) send
+                        # output items as separate events but the final
+                        # response.completed event has output=[].  We
+                        # accumulate them here and patch the completed
+                        # response if needed.
+                        collected_output_items: list[Any] = []
+                        for event in ret:
+                            if event is None:
+                                continue
+                            output_item, delta_chunk = self._process_stream_event(
+                                event, emit_deltas=stream_callback is not None
+                            )
+                            if output_item is not None:
+                                collected_output_items.append(output_item)
+                            if stream_callback is not None and delta_chunk is not None:
+                                stream_callback(delta_chunk)
+
+                        return self._finalize_stream_response(
+                            ret.completed_response, collected_output_items
+                        )
+
+                    raise AssertionError(
+                        f"Expected ResponsesAPIResponse, got {type(ret)}"
                     )
-                    if output_item is not None:
-                        collected_output_items.append(output_item)
-                    if stream_callback is not None and delta_chunk is not None:
-                        stream_callback(delta_chunk)
-
-                completed_response = getattr(
-                    ret, "completed_response", completed_response
-                )
-                return self._finalize_stream_response(
-                    completed_response, collected_output_items
-                )
-
-            raise AssertionError(f"Expected ResponsesAPIResponse, got {type(ret)}")
 
         try:
             return self._build_responses_result(_one_attempt())
@@ -1895,7 +1586,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     store,
                     add_security_risk_prediction=add_security_risk_prediction,
                     on_token=on_token,
-                    call_context=call_context,
                     **_caller_kwargs,
                 ),
             )
@@ -1909,9 +1599,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         tools: Sequence[ToolDefinition] | None = None,
         include: list[str] | None = None,
         store: bool | None = None,
+        _return_metrics: bool = False,
         add_security_risk_prediction: bool = False,
         on_token: AnyTokenCallbackType | None = None,
-        call_context: LLMCallContext | None = None,
         **kwargs,
     ) -> LLMResponse:
         """Async variant of :meth:`responses`.
@@ -1919,25 +1609,19 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         Uses ``litellm.aresponses`` under the hood, freeing the event loop
         while waiting for the LLM provider response.
         """
-        # See :meth:`acompletion`: resolve provider-aware runtime metadata before
-        # the first request so context management reads runtime (not model-level)
-        # limits. No blocking network I/O in-process.
-        await self.aresolve_runtime_metadata()
-
+        if _return_metrics:
+            warn_deprecated(
+                "LLM.aresponses(_return_metrics=...)",
+                deprecated_in="1.24.0",
+                removed_in="1.29.0",
+                details=_RETURN_METRICS_DETAILS,
+            )
         _caller_kwargs = kwargs.copy()
         user_enable_streaming = bool(kwargs.get("stream", False)) or self.stream
-        if user_enable_streaming and on_token is None and not self.requires_streaming:
-            # Gracefully degrade to non-streaming rather than crashing a run when
-            # streaming is requested without a callback wired. Providers that
-            # require streaming are exempt — they drain the stream internally
-            # without an on_token callback. See requires_streaming and #4014.
-            logger.debug(
-                "Streaming requested without an on_token callback; "
-                "falling back to a non-streaming responses call."
-            )
-            user_enable_streaming = False
-            kwargs.pop("stream", None)
-        elif user_enable_streaming:
+        if user_enable_streaming:
+            # We allow on_token to be None for subscription mode
+            if on_token is None and not self.is_subscription:
+                raise ValueError("Streaming requires an on_token callback")
             kwargs["stream"] = True
 
         (
@@ -1947,13 +1631,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             call_kwargs,
             telemetry_ctx,
         ) = await self._aprepare_responses_params(
-            messages,
-            tools,
-            include,
-            store,
-            add_security_risk_prediction,
-            kwargs,
-            call_context=call_context,
+            messages, tools, include, store, add_security_risk_prediction, kwargs
         )
 
         @self._make_retry_decorator()
@@ -1963,84 +1641,59 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             assert self._telemetry is not None
             self._telemetry.on_request(telemetry_ctx=telemetry_ctx)
             final_kwargs = {**call_kwargs, **retry_kwargs}
-            auth_values = await self._aget_litellm_auth_values()
-            litellm_kwargs = self._build_responses_call_kwargs(
-                input_items,
-                instructions,
-                resp_tools,
-                final_kwargs,
-                auth_values=auth_values,
-            )
-            ret = await litellm_aresponses(**litellm_kwargs)
-
-            if isinstance(ret, ResponsesAPIResponse):
-                if user_enable_streaming:
-                    logger.warning(
-                        "Responses streaming was requested, but the "
-                        "provider returned a non-streaming response; "
-                        "no on_token deltas will be emitted."
+            with self._litellm_modify_params_ctx(self.modify_params):
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning)
+                    litellm_kwargs = self._build_responses_call_kwargs(
+                        input_items, instructions, resp_tools, final_kwargs
                     )
-                self._telemetry.on_response(
-                    ret,
-                    provider_info=self._provider_info,
-                )
-                return ret
+                    ret = await litellm_aresponses(**litellm_kwargs)
 
-            # When stream=True, LiteLLM returns a streaming
-            # iterator rather than a single ResponsesAPIResponse.
-            # Third-party wrappers may replace LiteLLM's concrete
-            # iterator with another sync or async iterable, so drain
-            # by protocol.
-            if final_kwargs.get("stream", False):
-                stream_cb = on_token if user_enable_streaming else None
-                # Collect output items from streaming events.
-                # Some endpoints (e.g., Codex subscription) send
-                # output items as separate events but the final
-                # response.completed event has output=[].  We
-                # accumulate them here and patch the completed
-                # response if needed.
-                collected_output_items: list[Any] = []
-                completed_response = getattr(ret, "completed_response", None)
-                if hasattr(ret, "__aiter__"):
-                    stream = cast(AsyncIterable[Any], ret)
-                    async for event in stream:
-                        if event is None:
-                            continue
-                        if isinstance(event, ResponseCompletedEvent):
-                            completed_response = event
-                        output_item, delta_chunk = self._process_stream_event(
-                            event, emit_deltas=stream_cb is not None
+                    if isinstance(ret, ResponsesAPIResponse):
+                        if user_enable_streaming:
+                            logger.warning(
+                                "Responses streaming was requested, but the "
+                                "provider returned a non-streaming response; "
+                                "no on_token deltas will be emitted."
+                            )
+                        self._telemetry.on_response(ret)
+                        return ret
+
+                    # When stream=True, LiteLLM returns a streaming
+                    # iterator rather than a single ResponsesAPIResponse.
+                    # Drain the iterator and use the completed response.
+                    if final_kwargs.get("stream", False):
+                        if not isinstance(ret, ResponsesAPIStreamingIterator):
+                            raise AssertionError(
+                                "Expected Responses async stream "
+                                f"iterator, got {type(ret)}"
+                            )
+                        stream_cb = on_token if user_enable_streaming else None
+                        # Collect output items from streaming events.
+                        # Some endpoints (e.g., Codex subscription) send
+                        # output items as separate events but the final
+                        # response.completed event has output=[].  We
+                        # accumulate them here and patch the completed
+                        # response if needed.
+                        collected_output_items: list[Any] = []
+                        async for event in ret:
+                            if event is None:
+                                continue
+                            output_item, delta_chunk = self._process_stream_event(
+                                event, emit_deltas=stream_cb is not None
+                            )
+                            if output_item is not None:
+                                collected_output_items.append(output_item)
+                            if stream_cb is not None and delta_chunk is not None:
+                                await _invoke_token_callback(stream_cb, delta_chunk)
+
+                        return self._finalize_stream_response(
+                            ret.completed_response, collected_output_items
                         )
-                        if output_item is not None:
-                            collected_output_items.append(output_item)
-                        if stream_cb is not None and delta_chunk is not None:
-                            await _invoke_token_callback(stream_cb, delta_chunk)
-                else:
-                    loop = asyncio.get_running_loop()
-                    events: list[Any] = await loop.run_in_executor(
-                        None, list, cast(Iterable[Any], ret)
+
+                    raise AssertionError(
+                        f"Expected ResponsesAPIResponse, got {type(ret)}"
                     )
-                    for event in events:
-                        if event is None:
-                            continue
-                        if isinstance(event, ResponseCompletedEvent):
-                            completed_response = event
-                        output_item, delta_chunk = self._process_stream_event(
-                            event, emit_deltas=stream_cb is not None
-                        )
-                        if output_item is not None:
-                            collected_output_items.append(output_item)
-                        if stream_cb is not None and delta_chunk is not None:
-                            await _invoke_token_callback(stream_cb, delta_chunk)
-
-                completed_response = getattr(
-                    ret, "completed_response", completed_response
-                )
-                return self._finalize_stream_response(
-                    completed_response, collected_output_items
-                )
-
-            raise AssertionError(f"Expected ResponsesAPIResponse, got {type(ret)}")
 
         try:
             return self._build_responses_result(await _one_attempt())
@@ -2073,7 +1726,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                     store,
                     add_security_risk_prediction=add_security_risk_prediction,
                     on_token=_fb_token,
-                    call_context=call_context,
                     **_caller_kwargs,
                 ),
             )
@@ -2086,10 +1738,16 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         return litellm_call_kwargs(self.model, self.base_url)
 
     def _infer_litellm_provider(self) -> str | None:
-        provider_info = self._provider_info
-        if provider_info is None:
-            return None
-        return provider_info.name
+        if self._litellm_provider is not None:
+            return self._litellm_provider
+
+        call_kwargs = self._litellm_call_kwargs()
+        provider = infer_litellm_provider(
+            model=call_kwargs["model"],
+            api_base=call_kwargs["api_base"],
+        )
+        self._litellm_provider = provider
+        return provider
 
     def _infer_model_info_provider(self) -> str | None:
         if self._model_info is not None:
@@ -2099,112 +1757,67 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
 
         return self._infer_litellm_provider()
 
-    def _get_api_key_value(self) -> str | None:
-        if self.api_key is None:
-            return None
-        assert isinstance(self.api_key, SecretStr)
-        return self.api_key.get_secret_value()
-
-    def _subscription_headers_from_credentials(
-        self, auth: Any, credentials: Any
-    ) -> dict[str, str]:
-        account_id = auth.extract_chatgpt_account_id(credentials)
-        if not account_id:
-            return {}
-        return {"chatgpt-account-id": account_id}
-
-    def _subscription_api_key_from_credentials(self, credentials: Any) -> str:
-        return credentials.access_token
-
-    def _normalize_litellm_api_key_value(self, api_key_value: str | None) -> str | None:
-        provider_info = self._provider_info
-        if provider_info is None:
-            return api_key_value
-        return provider_info.api_key_for_litellm(api_key_value)
-
-    def _get_litellm_auth_values(self) -> tuple[str | None, dict[str, str]]:
-        api_key_value: str | None = None
-        extra_headers: dict[str, str] = {}
-        if self.is_subscription:
-            from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
-
-            auth = OpenAISubscriptionAuth(
-                credential_store=self._subscription_credential_store
-            )
-            credentials = self._subscription_credentials
-            if credentials is None or credentials.is_expired():
-                credentials = auth.refresh_if_needed_sync()
-            if credentials is None:
-                credentials = self._subscription_credentials
-            if credentials is None:
-                raise ValueError("OpenAI subscription login is required")
-            api_key_value = self._subscription_api_key_from_credentials(credentials)
-            extra_headers = self._subscription_headers_from_credentials(
-                auth, credentials
-            )
-        elif self.api_key:
-            api_key_value = self._get_api_key_value()
-
-        return self._normalize_litellm_api_key_value(api_key_value), extra_headers
-
     def _get_litellm_api_key_value(self) -> str | None:
-        api_key_value, _ = self._get_litellm_auth_values()
+        api_key_value: str | None = None
+        if self.api_key:
+            assert isinstance(self.api_key, SecretStr)
+            api_key_value = self.api_key.get_secret_value()
+
+        # LiteLLM treats api_key for Bedrock as an AWS bearer token.
+        # Passing a non-Bedrock key (e.g. OpenAI/Anthropic) can cause Bedrock
+        # to reject the request with an "Invalid API Key format" error.
+        # For IAM/SigV4 auth (the default Bedrock path), do not forward api_key.
+        if api_key_value is not None and self._infer_litellm_provider() == "bedrock":
+            return None
+
         return api_key_value
 
-    async def _aget_litellm_auth_values(self) -> tuple[str | None, dict[str, str]]:
-        if not self.is_subscription:
-            return self._get_litellm_auth_values()
+    @contextmanager
+    def _transport_ctx(self):
+        """Guard a litellm transport call.
 
-        from openhands.sdk.llm.auth.openai import OpenAISubscriptionAuth
-
-        auth = OpenAISubscriptionAuth(
-            credential_store=self._subscription_credential_store
-        )
-        credentials = await auth.refresh_if_needed()
-        if credentials is None:
-            credentials = self._subscription_credentials
-        if credentials is None:
-            raise ValueError("OpenAI subscription login is required")
-        api_key_value = self._normalize_litellm_api_key_value(
-            self._subscription_api_key_from_credentials(credentials)
-        )
-        return api_key_value, self._subscription_headers_from_credentials(
-            auth, credentials
-        )
-
-    async def _aget_litellm_api_key_value(self) -> str | None:
-        api_key_value, _ = await self._aget_litellm_auth_values()
-        return api_key_value
+        ``litellm.modify_params`` is GLOBAL, so it is guarded for thread-safety,
+        and the noisy provider/litellm warnings are filtered out for the call.
+        """
+        with self._litellm_modify_params_ctx(self.modify_params):
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", category=DeprecationWarning, module="httpx.*"
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*content=.*upload.*",
+                    category=DeprecationWarning,
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    message="There is no current event loop",
+                    category=DeprecationWarning,
+                )
+                warnings.filterwarnings("ignore", category=UserWarning)
+                warnings.filterwarnings(
+                    "ignore",
+                    category=DeprecationWarning,
+                    message="Accessing the 'model_fields' attribute.*",
+                )
+                yield
 
     def _prepare_transport_kwargs(
         self,
         *,
         messages: list[dict[str, Any]],
         enable_streaming: bool,
-        auth_values: tuple[str | None, dict[str, str]] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         """Build the keyword arguments for a litellm (a)completion call."""
-        provider_info = self._provider_info
-        assert provider_info is not None
-        assert_vertex_sdk_available(provider_info.name)
-
         # When streaming, request usage in the final chunk so that detailed
         # token breakdowns (prompt_tokens_details with cached_tokens, etc.) are
         # not silently discarded by litellm's streaming handler.
         if enable_streaming:
             kwargs.setdefault("stream_options", {"include_usage": True})
-        api_key_value, subscription_headers = (
-            auth_values if auth_values is not None else self._get_litellm_auth_values()
-        )
-        if subscription_headers:
-            kwargs["extra_headers"] = {
-                **(kwargs.get("extra_headers") or {}),
-                **subscription_headers,
-            }
         return {
-            **provider_info.as_litellm_call_kwargs(api_key=api_key_value),
-            "api_base": provider_info.api_base,
+            **self._litellm_call_kwargs(),
+            "api_key": self._get_litellm_api_key_value(),
             "api_version": self.api_version,
             "timeout": self.timeout,
             "drop_params": self.drop_params,
@@ -2222,23 +1835,24 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         on_token: TokenCallbackType | None = None,
         **kwargs,
     ) -> ModelResponse:
-        ret = litellm_completion(
-            **self._prepare_transport_kwargs(
-                messages=messages, enable_streaming=enable_streaming, **kwargs
+        with self._transport_ctx():
+            ret = litellm_completion(
+                **self._prepare_transport_kwargs(
+                    messages=messages, enable_streaming=enable_streaming, **kwargs
+                )
             )
-        )
-        if enable_streaming and on_token is not None:
-            chunks: list[ModelResponseStream] = []
-            stream = cast(Iterable[ModelResponseStream], ret)
-            for chunk in stream:
-                on_token(chunk)
-                chunks.append(chunk)
-            ret = litellm.stream_chunk_builder(chunks, messages=messages)
+            if enable_streaming and on_token is not None:
+                assert isinstance(ret, CustomStreamWrapper)
+                chunks: list[ModelResponseStream] = []
+                for chunk in ret:
+                    on_token(chunk)
+                    chunks.append(chunk)
+                ret = litellm.stream_chunk_builder(chunks, messages=messages)
 
-        assert isinstance(ret, ModelResponse), (
-            f"Expected ModelResponse, got {type(ret)}"
-        )
-        return ret
+            assert isinstance(ret, ModelResponse), (
+                f"Expected ModelResponse, got {type(ret)}"
+            )
+            return ret
 
     async def _atransport_call(
         self,
@@ -2249,38 +1863,34 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         **kwargs,
     ) -> ModelResponse:
         """Async variant of :meth:`_transport_call`."""
-        auth_values = await self._aget_litellm_auth_values()
-        ret = await litellm_acompletion(
-            **self._prepare_transport_kwargs(
-                messages=messages,
-                enable_streaming=enable_streaming,
-                auth_values=auth_values,
-                **kwargs,
-            )
-        )
-        if enable_streaming and on_token is not None:
-            chunks: list[ModelResponseStream] = []
-            # Some litellm wrappers (lmnr 0.7.47's instrumentor) hand
-            # back a plain sync generator from ``litellm_acompletion``
-            if hasattr(ret, "__aiter__"):
-                stream = cast(AsyncIterable[ModelResponseStream], ret)
-                async for chunk in stream:
-                    await _invoke_token_callback(on_token, chunk)
-                    chunks.append(chunk)
-            else:
-                loop = asyncio.get_running_loop()
-                synced_chunks: list[ModelResponseStream] = await loop.run_in_executor(
-                    None, list, cast(Iterable[ModelResponseStream], ret)
+        with self._transport_ctx():
+            ret = await litellm_acompletion(
+                **self._prepare_transport_kwargs(
+                    messages=messages, enable_streaming=enable_streaming, **kwargs
                 )
-                for chunk in synced_chunks:
+            )
+            if enable_streaming and on_token is not None:
+                assert isinstance(ret, CustomStreamWrapper)
+                chunks: list[ModelResponseStream] = []
+                async for chunk in ret:
                     await _invoke_token_callback(on_token, chunk)
                     chunks.append(chunk)
-            ret = litellm.stream_chunk_builder(chunks, messages=messages)
+                ret = litellm.stream_chunk_builder(chunks, messages=messages)
 
-        assert isinstance(ret, ModelResponse), (
-            f"Expected ModelResponse, got {type(ret)}"
-        )
-        return ret
+            assert isinstance(ret, ModelResponse), (
+                f"Expected ModelResponse, got {type(ret)}"
+            )
+            return ret
+
+    @contextmanager
+    def _litellm_modify_params_ctx(self, flag: bool):
+        with self._litellm_modify_params_lock:
+            old = getattr(litellm, "modify_params", None)
+            try:
+                litellm.modify_params = flag
+                yield
+            finally:
+                litellm.modify_params = old
 
     # =========================================================================
     # Capabilities, formatting, and info
@@ -2288,110 +1898,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     def _model_name_for_capabilities(self) -> str:
         """Return canonical name for capability lookups (e.g., vision support)."""
         return self.model_canonical_name or self.model
-
-    def _model_features(self) -> ModelFeatures:
-        """Resolve capabilities consistently for every request path."""
-        return get_features(
-            self._model_name_for_capabilities(),
-            model_info=self._model_info,
-            overrides=self.capability_overrides,
-        )
-
-    def _provider_has_joint_token_budget(self) -> bool:
-        """Whether the provider enforces input + max_tokens <= context_window.
-
-        Some providers (notably AWS Bedrock for Anthropic models) share a single
-        token window between input and requested output. Direct providers
-        (Anthropic, OpenAI, etc.) have independent input/output windows.
-        """
-        provider = self._infer_model_info_provider() or ""
-        return any(provider.startswith(p) for p in _JOINT_BUDGET_PROVIDER_PREFIXES)
-
-    def _clamp_max_tokens_for_joint_budget(
-        self,
-        call_kwargs: dict[str, Any],
-        formatted_messages: list[dict[str, Any]],
-        cc_tools: list[ChatCompletionToolParam],
-    ) -> dict[str, Any]:
-        """Clamp per-request output budget for joint-window providers.
-
-        For providers like Bedrock-Anthropic, ``input_tokens + max_tokens`` must
-        not exceed the context window. Our injected default for ``max_tokens`` is
-        the model's full ``max_output_tokens`` (e.g. 64k for Sonnet 4.5), which
-        for any input larger than roughly ``context_window - max_output_tokens``
-        will fail with "Input is too long for requested model" -- even when the
-        actual response would be small. Clamp to the headroom that actually
-        remains, with a safety margin and a floor so we never send ``0``.
-
-        For non-joint providers the parameters are independent budgets and we
-        leave the kwargs untouched.
-        """
-        if not self._provider_has_joint_token_budget():
-            return call_kwargs
-
-        context_window = self.effective_max_input_tokens
-        if not context_window:
-            return call_kwargs
-
-        # Both keys may appear depending on routing (Azure / extended thinking
-        # use ``max_tokens``; everything else uses ``max_completion_tokens``).
-        budget_key = next(
-            (k for k in ("max_tokens", "max_completion_tokens") if k in call_kwargs),
-            None,
-        )
-        if budget_key is None:
-            return call_kwargs
-        current_budget = call_kwargs.get(budget_key)
-        if not isinstance(current_budget, int) or current_budget <= 0:
-            return call_kwargs
-
-        try:
-            input_tokens = int(
-                token_counter(
-                    model=self.model,
-                    messages=formatted_messages,
-                    tools=cc_tools or None,
-                    custom_tokenizer=self._tokenizer,
-                )
-            )
-        except Exception:
-            logger.debug(
-                "Joint-budget clamp: token_counter failed for %s; "
-                "leaving max_tokens unchanged",
-                self.model,
-                exc_info=True,
-            )
-            return call_kwargs
-
-        headroom = context_window - input_tokens - JOINT_BUDGET_SAFETY_MARGIN_TOKENS
-        clamped = max(min(current_budget, headroom), JOINT_BUDGET_MIN_OUTPUT_TOKENS)
-
-        if clamped >= current_budget:
-            return call_kwargs
-
-        if headroom < JOINT_BUDGET_MIN_OUTPUT_TOKENS:
-            logger.warning(
-                "Input tokens (%s) leave only %s tokens of headroom in the %s "
-                "context window for %s; sending the floor of %s. The provider "
-                "may still reject this request -- consider condensing history.",
-                input_tokens,
-                max(headroom, 0),
-                context_window,
-                self.model,
-                JOINT_BUDGET_MIN_OUTPUT_TOKENS,
-            )
-        else:
-            logger.debug(
-                "Clamping %s from %s to %s for %s "
-                "(input_tokens=%s, context_window=%s, joint-budget provider)",
-                budget_key,
-                current_budget,
-                clamped,
-                self.model,
-                input_tokens,
-                context_window,
-            )
-        return {**call_kwargs, budget_key: clamped}
 
     def _init_model_info_and_caps(self) -> None:
         self._model_info = get_litellm_model_info(
@@ -2461,20 +1967,6 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
                             context_window,
                         )
                         effective_max_output_tokens = capped
-                    if (
-                        self.base_url is not None
-                        and not self.model.startswith("litellm_proxy/")
-                        and effective_max_output_tokens is not None
-                        and effective_max_output_tokens > DEFAULT_MAX_OUTPUT_TOKENS_CAP
-                    ):
-                        logger.debug(
-                            "Capping max_output_tokens from %s to %s for %s "
-                            "(model metadata may exceed provider limit)",
-                            effective_max_output_tokens,
-                            DEFAULT_MAX_OUTPUT_TOKENS_CAP,
-                            self.model,
-                        )
-                        effective_max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS_CAP
                 elif isinstance(self._model_info.get("max_tokens"), int):
                     # 'max_tokens' is ambiguous: some providers use it for total
                     # context window, not output limit. Cap it to avoid requesting
@@ -2529,7 +2021,32 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             )
 
     def vision_is_active(self) -> bool:
-        return not self.disable_vision and self._model_features().supports_vision
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return not self.disable_vision and self._supports_vision()
+
+    def _supports_vision(self) -> bool:
+        """Acquire from litellm if model is vision capable.
+
+        Returns:
+            bool: True if model is vision capable. Return False if model not
+                supported by litellm.
+        """
+        # litellm.supports_vision currently returns False for 'openai/gpt-...' or 'anthropic/claude-...' (with prefixes)  # noqa: E501
+        # but model_info will have the correct value for some reason.
+        # we can go with it, but we will need to keep an eye if model_info is correct for Vertex or other providers  # noqa: E501
+        # remove when litellm is updated to fix https://github.com/BerriAI/litellm/issues/5608  # noqa: E501
+        # Check both the full model name and the name after proxy prefix for vision support  # noqa: E501
+        model_for_caps = self._model_name_for_capabilities()
+        return (
+            supports_vision(model_for_caps)
+            or supports_vision(model_for_caps.split("/")[-1])
+            or (
+                self._model_info is not None
+                and self._model_info.get("supports_vision", False)
+            )
+            or False  # fallback to False if model_info is None
+        )
 
     def is_caching_prompt_active(self) -> bool:
         """Check if prompt caching is supported and enabled for current model.
@@ -2540,14 +2057,18 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         """
         if not self.caching_prompt:
             return False
-        return self.caching_prompt and self._model_features().supports_prompt_cache
+        # We don't need to look up model_info because explicit caching
+        # breakpoint support is tracked in the local feature table.
+        return (
+            self.caching_prompt
+            and get_features(self._model_name_for_capabilities()).supports_prompt_cache
+        )
 
     def uses_responses_api(self) -> bool:
         """Whether this model uses the OpenAI Responses API path."""
 
-        if self.api_mode != "auto":
-            return self.api_mode == "responses"
-        return self._model_features().supports_responses_api
+        # by default, uses = supports
+        return get_features(self._model_name_for_capabilities()).supports_responses_api
 
     @property
     def model_info(self) -> dict | None:
@@ -2558,135 +2079,19 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     def effective_max_input_tokens(self) -> int | None:
         """Resolved context window used at runtime.
 
-        ``max_input_tokens`` remains the user-configured value and always wins.
-        When it is unset, a previously resolved provider-aware runtime limit is
-        used (this property performs no network I/O), falling back to the value
-        discovered from model metadata.
+        ``max_input_tokens`` remains the user-configured value. When it is
+        unset, this property reflects the value discovered from model metadata.
         """
-        if self.max_input_tokens:
-            return self.max_input_tokens
-        cached = cached_metadata(
-            self._runtime_metadata, self._runtime_metadata_fetched_at
-        )
-        if cached is not None and cached.max_input_tokens is not None:
-            return cached.max_input_tokens
-        return self._effective_max_input_tokens
+        return self.max_input_tokens or self._effective_max_input_tokens
 
     @property
     def effective_max_output_tokens(self) -> int | None:
         """Resolved output token limit used at runtime.
 
-        ``max_output_tokens`` remains the user-configured value and always
-        wins. This property performs no network I/O and falls back to the value
-        discovered from model metadata. Runtime (provider) resolution only
-        refines the input/context limit, never the output limit, so no call
-        here is needed for output tokens (see issue #4421).
+        ``max_output_tokens`` remains the user-configured value. When it is
+        unset, this property reflects provider/model defaults and safety caps.
         """
         return self.max_output_tokens or self._effective_max_output_tokens
-
-    # =========================================================================
-    # Runtime (provider-aware) metadata
-    # =========================================================================
-    def resolve_runtime_metadata(
-        self, *, force: bool = False
-    ) -> ModelRuntimeMetadata | None:
-        """Resolve provider-aware runtime limits synchronously (lazy + cached).
-
-        Discovery never runs during construction. Unsupported providers and
-        unresolvable routes return ``None`` so callers fall back to static
-        model metadata. Successful results are cached for
-        ``RUNTIME_METADATA_TTL_SECONDS``; failures are negative-cached briefly.
-
-        Prefer :meth:`aresolve_runtime_metadata` on the agent-server event loop,
-        which performs no blocking network I/O in-process. A concurrent
-        resolution already in flight cannot be overwritten by a stale
-        (earlier-started) probe: each probe carries a generation, and only the
-        latest generation may publish its result.
-        """
-        # The LLM may be shared across threads via the sync path, so the cache
-        # read/check and the store must be atomic. The network probe itself runs
-        # outside the lock so a slow endpoint cannot block other threads from
-        # reading the cache.
-        with self._runtime_metadata_lock:
-            if not force:
-                cached = cached_metadata(
-                    self._runtime_metadata, self._runtime_metadata_fetched_at
-                )
-                if cached is not None:
-                    return cached
-                if in_negative_cache(self._runtime_metadata_negative_until):
-                    return None
-            generation = self._runtime_metadata_generation + 1
-            self._runtime_metadata_generation = generation
-
-        metadata = resolve_provider_metadata_sync(self)
-        self._store_runtime_metadata(metadata, generation)
-        return metadata
-
-    async def aresolve_runtime_metadata(
-        self, *, force: bool = False
-    ) -> ModelRuntimeMetadata | None:
-        """Async variant of :meth:`resolve_runtime_metadata`.
-
-        Concurrent calls for the same route are deduplicated so only one
-        upstream request is issued. If the caller is configuring the condenser
-        or context management, resolve before computing a token threshold.
-
-        Because the agent-server may drive a shared ``LLM`` from multiple event
-        loops, a result is only published if no *newer* resolution (started via
-        the sync path on another thread, or a forced re-resolution) has landed
-        meanwhile.
-        """
-        if not force:
-            cached = cached_metadata(
-                self._runtime_metadata, self._runtime_metadata_fetched_at
-            )
-            if cached is not None:
-                return cached
-            if in_negative_cache(self._runtime_metadata_negative_until):
-                return None
-
-        with self._runtime_metadata_lock:
-            generation = self._runtime_metadata_generation + 1
-            self._runtime_metadata_generation = generation
-
-        metadata = await aresolve_provider_metadata(self)
-        self._store_runtime_metadata(metadata, generation)
-        return metadata
-
-    def _store_runtime_metadata(
-        self, metadata: ModelRuntimeMetadata | None, generation: int
-    ) -> None:
-        fetched_at, negative_until, resolved = store_result(metadata)
-        # Locked so a concurrent synchronous resolver (its probe runs outside the
-        # lock) cannot observe a torn / interleaved cache state. Generation
-        # guards against a stale (earlier-started) probe overwriting the result
-        # of a newer resolution: only the latest generation may publish.
-        with self._runtime_metadata_lock:
-            if generation != self._runtime_metadata_generation:
-                # Superseded by a newer resolution; drop this result.
-                return
-            self._runtime_metadata_fetched_at = fetched_at
-            self._runtime_metadata_negative_until = negative_until
-            if resolved is not None:
-                self._runtime_metadata = resolved
-            self._runtime_metadata_key = runtime_metadata_cache_key(self)
-
-    def _reset_runtime_metadata_for_key(self) -> None:
-        """Drop the runtime-metadata cache when the route (cache key) changes."""
-        with self._runtime_metadata_lock:
-            self._runtime_metadata = None
-            self._runtime_metadata_fetched_at = None
-            self._runtime_metadata_negative_until = None
-            self._runtime_metadata_key = None
-            self._runtime_metadata_generation += 1
-
-    @property
-    def resolved_runtime_metadata(self) -> ModelRuntimeMetadata | None:
-        """Currently cached runtime metadata, without triggering discovery."""
-        return cached_metadata(
-            self._runtime_metadata, self._runtime_metadata_fetched_at
-        )
 
     # =========================================================================
     # Utilities preserved from previous class
@@ -2725,7 +2130,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         """Resolve whether http(s) image URLs must be downloaded and inlined."""
         if self.inline_image_urls is not None:
             return self.inline_image_urls
-        return self._model_features().requires_inline_image_data
+        return get_features(
+            self._model_name_for_capabilities()
+        ).requires_inline_image_data
 
     def _begin_chat_messages(
         self, messages: list[Message]
@@ -2761,7 +2168,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         return messages
 
     def _to_chat_dicts(self, messages: list[Message]) -> list[dict]:
-        model_features = self._model_features()
+        model_features = get_features(self._model_name_for_capabilities())
         cache_enabled = self.is_caching_prompt_active()
         vision_enabled = self.vision_is_active()
         function_calling_enabled = self.native_tool_calling
@@ -2911,13 +2318,12 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             )
             cc_tools = []
 
-        template_count = self._get_chat_template_token_count(
-            formatted_messages, cc_tools
-        )
-        if template_count is not None:
-            return template_count
-
         try:
+            template_count = self._get_chat_template_token_count(
+                formatted_messages, cc_tools
+            )
+            if template_count is not None:
+                return template_count
             return int(
                 token_counter(
                     model=self.model,
@@ -3082,22 +2488,11 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
 
         payload.pop("schema_version", None)
         payload = canonicalize_openhands_llm_payload(payload)
-        llm = cls.model_validate(payload, context=context)
-        if llm.auth_type == "subscription":
-            from openhands.sdk.llm.auth.openai import (
-                create_subscription_llm_from_config,
-            )
-
-            return create_subscription_llm_from_config(llm)
-        return llm
+        return cls.model_validate(payload, context=context)
 
     def to_persisted(self, *, context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Serialize this LLM for profile persistence."""
         data = self.model_dump(mode="json", exclude_none=True, context=context)
-        if data.get("auth_type") == "subscription":
-            data.pop("api_key", None)
-            data.pop("base_url", None)
-            data.pop("extra_headers", None)
         data["schema_version"] = LLM_PROFILE_SCHEMA_VERSION
         return data
 
@@ -3175,14 +2570,7 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             v = _cast_value(value, fields[field_name])
             if v is not None:
                 data[field_name] = v
-        llm = cls(**data)
-        if llm.auth_type == "subscription":
-            from openhands.sdk.llm.auth.openai import (
-                create_subscription_llm_from_config,
-            )
-
-            return create_subscription_llm_from_config(llm)
-        return llm
+        return cls(**data)
 
     @classmethod
     def subscription_login(
@@ -3205,13 +2593,10 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         - "openai": ChatGPT Plus/Pro subscription for Codex models
 
         Supported OpenAI models:
-        - gpt-5.6
-        - gpt-5.6-sol
-        - gpt-5.6-terra
-        - gpt-5.6-luna
-        - gpt-5.5
-        - gpt-5.4
-        - gpt-5.4-mini
+        - gpt-5.1-codex-max
+        - gpt-5.1-codex-mini
+        - gpt-5.2
+        - gpt-5.2-codex
 
         Args:
             vendor: The vendor/provider. Currently only "openai" is supported.
@@ -3236,10 +2621,10 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             from openhands.sdk import LLM
 
             # First time: opens browser for OAuth login
-            llm = LLM.subscription_login(vendor="openai", model="gpt-5.6")
+            llm = LLM.subscription_login(vendor="openai", model="gpt-5.2-codex")
 
             # Subsequent calls: reuses cached credentials
-            llm = LLM.subscription_login(vendor="openai", model="gpt-5.6")
+            llm = LLM.subscription_login(vendor="openai", model="gpt-5.2-codex")
             ```
         """
         from openhands.sdk.llm.auth.openai import subscription_login

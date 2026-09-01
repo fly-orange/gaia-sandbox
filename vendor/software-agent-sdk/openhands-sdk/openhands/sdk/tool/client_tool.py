@@ -298,7 +298,6 @@ class ClientTool(ToolDefinition[Action, ClientToolObservation]):
                     required = merged.setdefault("required", [])
                     if meta not in required:
                         required.append(meta)
-        merged = self._merge_response_schema(merged)
 
         from openhands.sdk.tool.tool import _prioritize_schema_fields
 

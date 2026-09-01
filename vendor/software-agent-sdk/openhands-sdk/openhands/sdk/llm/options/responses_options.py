@@ -1,17 +1,9 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from openhands.sdk.llm.options.common import (
-    apply_call_context,
-    apply_defaults_if_absent,
-    apply_extra_body,
-    apply_extra_headers,
-)
-
-
-if TYPE_CHECKING:
-    from openhands.sdk.llm.llm import LLMCallContext
+from openhands.sdk.llm.options.common import apply_defaults_if_absent
+from openhands.sdk.llm.utils.model_features import get_features
 
 
 def select_responses_options(
@@ -20,7 +12,6 @@ def select_responses_options(
     *,
     include: list[str] | None,
     store: bool | None,
-    call_context: LLMCallContext | None = None,
 ) -> dict[str, Any]:
     """Behavior-preserving extraction of _normalize_responses_kwargs."""
     # Apply defaults for keys that are not forced by policy
@@ -30,22 +21,31 @@ def select_responses_options(
         defaults["max_output_tokens"] = llm.effective_max_output_tokens
     out = apply_defaults_if_absent(user_kwargs, defaults)
 
-    model_features = llm._model_features()
-    if not llm.is_subscription and model_features.supports_sampling_params is False:
-        out.pop("temperature", None)
-        out.pop("top_p", None)
-        out.pop("top_k", None)
-    elif not llm.is_subscription and llm.temperature is not None:
-        out.setdefault("temperature", llm.temperature)
+    # Enforce sampling/tool behavior for Responses path
+    # Note: temperature is not supported in subscription mode
+    if not llm.is_subscription:
+        out["temperature"] = 1.0
     out["tool_choice"] = "auto"
 
-    out = apply_extra_headers(out, llm)
+    # If user didn't set extra_headers, propagate from llm config
+    if llm.extra_headers is not None and "extra_headers" not in out:
+        out["extra_headers"] = dict(llm.extra_headers)
+
+    # Inject OpenRouter HTTP-Referer / X-Title via extra_headers so we don't
+    # have to mutate os.environ (which would leak across conversations in a
+    # multi-tenant server; see issue #3138). User-supplied headers win.
+    openrouter_headers = llm._openrouter_headers()
+    if openrouter_headers:
+        existing = out.get("extra_headers") or {}
+        out["extra_headers"] = {**openrouter_headers, **existing}
 
     # Store defaults to False (stateless) unless explicitly provided
     if store is not None:
         out["store"] = bool(store)
     else:
         out.setdefault("store", False)
+
+    model_features = get_features(llm._model_name_for_capabilities())
 
     # Include encrypted reasoning only when the user enables it on the LLM,
     # and only for stateless calls (store=False). Respect user choice.
@@ -81,7 +81,11 @@ def select_responses_options(
     ):
         out["prompt_cache_retention"] = llm.prompt_cache_retention
 
-    out = apply_extra_body(out, llm)
-    out = apply_call_context(out, llm, call_context)
+    # Pass through user-provided extra_body unchanged
+    if llm.litellm_extra_body:
+        out["extra_body"] = llm.litellm_extra_body
+
+    if llm._prompt_cache_key:
+        out["prompt_cache_key"] = llm._prompt_cache_key
 
     return out

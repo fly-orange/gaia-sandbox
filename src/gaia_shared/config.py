@@ -10,6 +10,7 @@ class Config:
     llm: dict
     sandbox: dict
     gaia: dict
+    agent: dict
 
     def path(self, value: str) -> Path:
         return (self.root / value).resolve()
@@ -20,6 +21,8 @@ def load(path: Path) -> Config:
     with path.open("rb") as f:
         raw = tomllib.load(f)
     cfg = Config(path.parent, **raw)
+    if cfg.agent["tool_preset"] != "default":
+        raise ValueError("This compatibility baseline supports tool_preset=default only")
     for value in (
         cfg.server["max_concurrency"],
         cfg.server["request_timeout"],
@@ -29,9 +32,16 @@ def load(path: Path) -> Config:
         cfg.sandbox["command_timeout"],
         cfg.llm["max_iterations"],
         cfg.gaia["workers"],
+        cfg.sandbox["tool_startup_timeout"],
+        cfg.sandbox["tool_call_timeout"],
+        cfg.agent["mcp_init_timeout"],
     ):
         if value <= 0:
             raise ValueError("Concurrency, resource limits and timeouts must be positive")
+    if not 0 <= cfg.agent["condenser_keep_first"] < cfg.agent["condenser_max_size"]:
+        raise ValueError("condenser_keep_first must be below condenser_max_size")
+    if cfg.agent["max_fake_responses"] < 0:
+        raise ValueError("max_fake_responses must be nonnegative")
     if cfg.sandbox["network"] not in ("bridge", "none"):
         raise ValueError("sandbox.network must be bridge or none; host networking is forbidden")
     if cfg.gaia["split"] not in ("validation", "test"):

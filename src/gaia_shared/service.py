@@ -10,6 +10,7 @@ import psutil
 
 from .io import append_json, stamp
 from .provenance import fingerprint, profile, source_fingerprint
+from .schema import IMAGE_SUFFIXES
 
 
 class SharedService:
@@ -151,7 +152,21 @@ class SharedService:
             result["sandbox_image"] = self.cfg.sandbox["image"]
             sampler = asyncio.create_task(sample())
             for attachment in request.attachments:
-                await asyncio.to_thread(sandbox.upload, attachment)
+                if Path(attachment.name).suffix.lower() not in IMAGE_SUFFIXES:
+                    await asyncio.to_thread(sandbox.upload, attachment)
+            worker_config = {
+                "source_sha256": self.source_sha256,
+                "agent": self.cfg.agent,
+                "sandbox": self.cfg.sandbox,
+                "vision": self.cfg.llm["vision"],
+                "browser": True,
+                "tavily_key": os.getenv("TAVILY_API_KEY", ""),
+            }
+            worker = await asyncio.to_thread(
+                sandbox.start_tools, worker_config, directory
+            )
+            result["tool_worker_pid"] = worker["worker_pid"]
+            result["tool_names"] = [item["name"] for item in worker["tools"]]
             session = self.session_factory(run_id, sandbox, request, directory)
             result["sandbox_stats_after_init"] = await asyncio.to_thread(sandbox.stats)
             result["initialization_seconds"] = time.monotonic() - start

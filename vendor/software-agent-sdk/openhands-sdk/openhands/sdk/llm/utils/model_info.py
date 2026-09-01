@@ -1,11 +1,9 @@
 import time
-from collections.abc import Mapping
 from functools import lru_cache
 from logging import getLogger
-from typing import Any
 
 import httpx
-from litellm import model_cost
+from litellm.types.utils import ModelInfo
 from litellm.utils import get_model_info
 from pydantic import SecretStr
 
@@ -13,15 +11,6 @@ from openhands.sdk.llm.utils.openhands_provider import litellm_call_kwargs
 
 
 logger = getLogger(__name__)
-
-
-def _merge_raw_model_metadata(model_info: Mapping[str, Any]) -> dict[str, Any]:
-    """Preserve raw LiteLLM capability fields."""
-    key = model_info.get("key")
-    raw = model_cost.get(key) if isinstance(key, str) else None
-    if not isinstance(raw, dict):
-        return dict(model_info)
-    return {**raw, **model_info}
 
 
 @lru_cache
@@ -72,7 +61,7 @@ def _get_model_info_from_litellm_proxy(
 
 def get_litellm_model_info(
     secret_api_key: SecretStr | str | None, base_url: str | None, model: str
-) -> dict[str, Any] | None:
+) -> ModelInfo | None:
     call_kwargs = litellm_call_kwargs(model, base_url)
     model = call_kwargs["model"]
     base_url = call_kwargs["api_base"]
@@ -82,7 +71,7 @@ def get_litellm_model_info(
         if model.startswith("openrouter"):
             model_info = get_model_info(model)
             if model_info:
-                return _merge_raw_model_metadata(model_info)
+                return model_info
     except Exception as e:
         logger.debug(f"get_model_info(openrouter) failed: {e}")
 
@@ -103,13 +92,13 @@ def get_litellm_model_info(
     try:
         model_info = get_model_info(model.split(":")[0])
         if model_info:
-            return _merge_raw_model_metadata(model_info)
+            return model_info
     except Exception:
         pass
     try:
         model_info = get_model_info(model.split("/")[-1])
         if model_info:
-            return _merge_raw_model_metadata(model_info)
+            return model_info
     except Exception:
         pass
 

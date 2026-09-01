@@ -51,6 +51,23 @@ async def test_parallel_tasks_share_server_not_sandbox(cfg, factory):
     assert all((service.root / r["run_id"] / "result.json").exists() for r in results)
 
 
+async def test_image_is_not_uploaded_to_sandbox(cfg, factory):
+    import base64
+
+    from gaia_shared.schema import Attachment
+
+    service = SharedService(cfg, factory, Session)
+    result = await service.execute(
+        TaskRequest(
+            task_id="image",
+            question="inspect",
+            attachments=[Attachment(name="image.png", data_base64=base64.b64encode(b"x").decode())],
+        )
+    )
+    assert result["status"] == "completed"
+    assert factory.created[0].files == []
+
+
 async def test_timeout_and_failure_cleanup(cfg, factory):
     class Failing(Session):
         async def run(self):

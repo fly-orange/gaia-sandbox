@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
-import subprocess
 from collections.abc import Callable
-from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fastmcp.mcp_config import MCPConfig
 
@@ -26,101 +24,6 @@ if TYPE_CHECKING:
 SecretLookup = Callable[[str], str | None]
 
 logger = get_logger(__name__)
-
-# Regex patterns for variable expansion
-# Braced only: ${VAR} or ${VAR:-default}
-_BRACED_VAR_PATTERN = re.compile(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::-([^}]*))?\}")
-# Braced and unbraced: $VAR, ${VAR}, or ${VAR:-default}
-_ALL_VAR_PATTERN = re.compile(
-    r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::-([^}]*))?\}|\$([a-zA-Z_][a-zA-Z0-9_]*)"
-)
-
-
-def expand_variable_references(
-    data: Any,
-    *,
-    variables: dict[str, str] | None = None,
-    get_secret: SecretLookup | None = None,
-    check_env: bool = False,
-    expand_defaults: bool = True,
-    support_unbraced: bool = False,
-) -> Any:
-    """Expand variable references in data structures.
-
-    This is the core expansion function used by both MCP config expansion
-    and runtime tool parameter expansion.
-
-    Supports variable expansion patterns:
-    - ${VAR} - Braced variable reference (always supported)
-    - ${VAR:-default} - With default value (always supported)
-    - $VAR - Unbraced variable reference (only if support_unbraced=True)
-
-    Resolution order (each source is checked only if provided/enabled):
-    1. Provided variables dict
-    2. Secrets (via get_secret callback)
-    3. Environment variables (only if check_env=True)
-    4. Default value (only if expand_defaults=True)
-
-    Args:
-        data: Data to expand (string, dict, list, or other).
-        variables: Dictionary of variable names to values.
-        get_secret: Callback to look up a secret by name.
-        check_env: If True, check os.environ for unresolved variables.
-        expand_defaults: If True, apply default values for unresolved variables.
-        support_unbraced: If True, support $VAR syntax in addition to ${VAR}.
-
-    Returns:
-        Data with variable references expanded.
-    """
-    pattern = _ALL_VAR_PATTERN if support_unbraced else _BRACED_VAR_PATTERN
-
-    def replace_var(match: re.Match) -> str:
-        # For braced pattern: group(1) = var_name, group(2) = default
-        # For all pattern: group(1)=braced, group(2)=default, group(3)=unbraced
-        if support_unbraced:
-            braced_var = match.group(1)
-            default_value = match.group(2)
-            unbraced_var = match.group(3)
-            var_name = braced_var or unbraced_var
-        else:
-            var_name = match.group(1)
-            default_value = match.group(2)
-
-        # Resolution order: variables -> secrets -> env -> default
-        if variables is not None and var_name in variables:
-            return variables[var_name]
-
-        if get_secret is not None:
-            secret_value = get_secret(var_name)
-            if secret_value is not None:
-                return secret_value
-
-        if check_env and var_name in os.environ:
-            return os.environ[var_name]
-
-        # Apply default only if expand_defaults is True and we have a default
-        if expand_defaults and default_value is not None:
-            return default_value
-
-        # Return original if not found (preserves placeholder)
-        return match.group(0)
-
-    def expand_value(value: Any) -> Any:
-        match value:
-            case str():
-                return pattern.sub(replace_var, value)
-            case dict():
-                return {
-                    expand_value(k) if isinstance(k, str) else k: expand_value(v)
-                    for k, v in value.items()
-                }
-            case list():
-                return [expand_value(item) for item in value]
-            case _:
-                return value
-
-    return expand_value(data)
-
 
 # Standard resource directory names per AgentSkills spec
 RESOURCE_DIRECTORIES = ("scripts", "references", "assets")
@@ -144,8 +47,7 @@ def find_skill_md(skill_dir: Path) -> Path | None:
     """
     if not skill_dir.is_dir():
         return None
-    # sorted() ensures deterministic case-collision winner (SKILL.md < skill.md).
-    for item in sorted(skill_dir.iterdir()):
+    for item in skill_dir.iterdir():
         if item.is_file() and item.name.lower() == "skill.md":
             return item
     return None
@@ -168,6 +70,23 @@ def find_mcp_config(skill_dir: Path) -> Path | None:
     return None
 
 
+def _serialize_for_json(obj: object) -> object:
+    """Recursively convert Pydantic models to dicts for JSON serialization.
+
+    This handles the case where MCP config contains Pydantic model objects
+    (RemoteMCPServer, StdioMCPServer) instead of plain dicts.
+    """
+    # Check for Pydantic v2 model_dump method
+    model_dump = getattr(obj, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    elif isinstance(obj, dict):
+        return {k: _serialize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_serialize_for_json(item) for item in obj]
+    return obj
+
+
 def expand_mcp_variables(
     config: dict,
     variables: dict[str, str],
@@ -188,7 +107,9 @@ def expand_mcp_variables(
     4. Default value (if specified and expand_defaults=True)
 
     Args:
-        config: MCP configuration dictionary.
+        config: MCP configuration dictionary. May contain Pydantic model objects
+            (e.g., RemoteMCPServer, StdioMCPServer) which will be converted to
+            dicts before JSON serialization.
         variables: Dictionary of variable names to values (e.g., SKILL_ROOT).
         get_secret: Callback to look up a secret by name. We use a callback
             rather than a dict to avoid extracting all secrets into plain text.
@@ -200,18 +121,44 @@ def expand_mcp_variables(
     Returns:
         Configuration with variables expanded.
     """
-    # Use the shared expansion function with MCP config settings:
-    # - check_env=True (check environment variables)
-    # - support_unbraced=False (only ${VAR} syntax for config files)
-    expanded_config = expand_variable_references(
-        config,
-        variables=variables,
-        get_secret=get_secret,
-        check_env=True,
-        expand_defaults=expand_defaults,
-        support_unbraced=False,
-    )
+    # Convert Pydantic models to plain containers before variable expansion.
+    serializable_config = _serialize_for_json(config)
 
+    # Pattern for ${VAR} or ${VAR:-default}
+    var_pattern = re.compile(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)(?::-([^}]*))?\}")
+
+    def replace_var(match: re.Match) -> str:
+        var_name = match.group(1)
+        default_value = match.group(2)
+
+        # Check provided variables first, then secrets, then environment
+        if var_name in variables:
+            return variables[var_name]
+        if get_secret is not None:
+            secret_value = get_secret(var_name)
+            if secret_value is not None:
+                return secret_value
+        if var_name in os.environ:
+            return os.environ[var_name]
+        # Apply default only if expand_defaults is True
+        if expand_defaults and default_value is not None:
+            return default_value
+        # Return original if not found (preserves placeholder for later expansion)
+        return match.group(0)
+
+    def expand_value(value: object) -> object:
+        if isinstance(value, str):
+            return var_pattern.sub(replace_var, value)
+        if isinstance(value, dict):
+            return {
+                expand_value(key) if isinstance(key, str) else key: expand_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [expand_value(item) for item in value]
+        return value
+
+    expanded_config = expand_value(serializable_config)
     if not isinstance(expanded_config, dict):
         raise TypeError("expanded MCP config must be a dictionary")
     return expanded_config
@@ -264,7 +211,7 @@ def load_mcp_config(
         config, variables, get_secret=get_secret, expand_defaults=expand_defaults
     )
 
-    # Validate the external .mcp.json shape using FastMCP's config model.
+    # Validate using MCPConfig
     try:
         MCPConfig.model_validate(config)
     except Exception as e:
@@ -331,8 +278,7 @@ def find_third_party_files(
     files: list[Path] = []
     seen_names: set[str] = set()
     seen_real_paths: set[Path] = set()
-    # sorted() so an AGENTS.md/agents.md collision and the order are deterministic.
-    for item in sorted(repo_root.iterdir()):
+    for item in repo_root.iterdir():
         if item.is_file() and item.name.lower() in target_names:
             # Avoid duplicates (e.g., AGENTS.md and agents.md in same dir)
             name_lower = item.name.lower()
@@ -358,86 +304,6 @@ def find_third_party_files(
     return files
 
 
-def _git_worktree_relpaths(work_dir: Path) -> list[PurePosixPath] | None:
-    """Return worktree file paths under ``work_dir`` (relative to it): tracked
-    plus untracked files that ``.gitignore`` does not exclude, so a freshly
-    written (uncommitted) file still counts. None when git is unavailable, so the
-    caller can walk instead."""
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        proc = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(work_dir),
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-        if proc.returncode != 0:
-            return None
-        text = proc.stdout.decode("utf-8", "surrogateescape")
-        return [PurePosixPath(p) for p in text.split("\0") if p]
-    return None
-
-
-def _walk_relpaths(work_dir: Path) -> list[PurePosixPath]:
-    """Filesystem-walk fallback: file paths under ``work_dir`` (relative to it),
-    skipping hidden and ``node_modules`` directories. Used only when git is
-    unavailable (the git path relies on ``.gitignore`` instead)."""
-    results: list[PurePosixPath] = []
-    for dirpath, dirnames, filenames in os.walk(work_dir):
-        # Prune in place so os.walk does not descend into skipped directories.
-        dirnames[:] = [
-            d for d in dirnames if not d.startswith(".") and d != "node_modules"
-        ]
-        rel_dir = Path(dirpath).relative_to(work_dir)
-        for filename in filenames:
-            results.append(PurePosixPath((rel_dir / filename).as_posix()))
-    return results
-
-
-def find_nested_third_party_files(
-    work_dir: Path, third_party_skill_names: dict[str, str]
-) -> list[tuple[Path, PurePosixPath]]:
-    """Find third-party instruction files *nested* under ``work_dir`` (top-level
-    ones are handled by :func:`find_third_party_files`), so each can become a
-    directory-scoped path rule. Uses ``git ls-files`` when available, else a
-    pruned walk. Returns ``(absolute_path, relative_dir)`` tuples with
-    ``relative_dir`` POSIX-relative to ``work_dir``."""
-    if not work_dir.exists():
-        return []
-
-    target_names = {name.lower() for name in third_party_skill_names}
-    rel_paths = _git_worktree_relpaths(work_dir)
-    if rel_paths is None:
-        rel_paths = _walk_relpaths(work_dir)
-
-    results: list[tuple[Path, PurePosixPath]] = []
-    seen_real_paths: set[Path] = set()
-    for rel in rel_paths:
-        if rel.name.lower() not in target_names:
-            continue
-        rel_dir = rel.parent
-        # Skip top-level files: those belong to find_third_party_files.
-        if rel_dir == PurePosixPath("."):
-            continue
-        abs_path = work_dir / rel
-        if not abs_path.is_file():
-            continue
-        real_path = abs_path.resolve()
-        if real_path in seen_real_paths:
-            continue
-        seen_real_paths.add(real_path)
-        results.append((abs_path, rel_dir))
-    return sorted(results, key=lambda pair: pair[1].as_posix())
-
-
 def find_skill_md_directories(skill_dir: Path) -> list[Path]:
     """Find AgentSkills-style directories containing SKILL.md files.
 
@@ -450,7 +316,7 @@ def find_skill_md_directories(skill_dir: Path) -> list[Path]:
     results: list[Path] = []
     if not skill_dir.exists():
         return results
-    for subdir in sorted(skill_dir.iterdir()):
+    for subdir in skill_dir.iterdir():
         if subdir.is_dir():
             skill_md = find_skill_md(subdir)
             if skill_md:
@@ -471,7 +337,7 @@ def find_regular_md_files(skill_dir: Path, exclude_dirs: set[Path]) -> list[Path
     files: list[Path] = []
     if not skill_dir.exists():
         return files
-    for f in sorted(skill_dir.rglob("*.md")):
+    for f in skill_dir.rglob("*.md"):
         is_readme = f.name == "README.md"
         is_skill_md = f.name.lower() == "skill.md"
         is_in_excluded_dir = any(f.is_relative_to(d) for d in exclude_dirs)

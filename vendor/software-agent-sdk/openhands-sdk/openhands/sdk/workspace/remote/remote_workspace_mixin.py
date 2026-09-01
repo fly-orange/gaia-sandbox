@@ -83,7 +83,7 @@ class RemoteWorkspaceMixin(BaseModel):
         Returns:
             CommandResult: Result with stdout, stderr, exit_code, and other metadata
         """
-        _logger.debug("Executing remote command")
+        _logger.debug(f"Executing remote command: {command}")
 
         # Step 1: Start the bash command
         payload = {
@@ -173,11 +173,7 @@ class RemoteWorkspaceMixin(BaseModel):
 
             # If we timed out waiting for completion
             if exit_code is None:
-                _logger.warning(
-                    "Command timed out after %s seconds (command_id=%s)",
-                    timeout,
-                    command_id,
-                )
+                _logger.warning(f"Command timed out after {timeout} seconds: {command}")
                 exit_code = -1
                 stderr_parts.append(f"Command timed out after {timeout} seconds")
 
@@ -194,10 +190,7 @@ class RemoteWorkspaceMixin(BaseModel):
             )
 
         except Exception as e:
-            _logger.error(
-                "Remote command execution failed (error_type=%s)",
-                type(e).__name__,
-            )
+            _logger.error(f"Remote command execution failed: {e}")
             return CommandResult(
                 command=command,
                 exit_code=-1,

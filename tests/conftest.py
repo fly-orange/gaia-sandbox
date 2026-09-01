@@ -3,8 +3,61 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from openhands.sdk import Action, Observation, ToolDefinition
+from openhands.sdk.tool import ToolExecutor, register_tool
 
 from gaia_shared.config import load
+
+
+class TestSandboxAction(Action):
+    command: str
+
+
+class TestSandboxObservation(Observation):
+    output: str = ""
+
+
+class TestSandboxExecutor(ToolExecutor):
+    def __call__(self, action, conversation=None):
+        return TestSandboxObservation.from_text("unused", output="unused")
+
+
+class TestSandboxTool(ToolDefinition):
+    @classmethod
+    def create(cls, conv_state):
+        return [cls(
+            description="test sandbox", action_type=TestSandboxAction,
+            observation_type=TestSandboxObservation, executor=TestSandboxExecutor(),
+        )]
+
+
+register_tool(TestSandboxTool.name, TestSandboxTool)
+
+
+class FakeWorker:
+    def __init__(self, sandbox):
+        self.sandbox = sandbox
+
+    def call(self, method, payload, timeout):
+        if method == "describe":
+            return {"tools": [self.definition()]}
+        if method == "call":
+            self.sandbox.commands.append(payload["action"]["command"])
+            return {"observation": {
+                "content": [{"text": self.sandbox.id}], "is_error": False,
+                "original": {"output": self.sandbox.id},
+            }}
+        raise AssertionError(method)
+
+    @staticmethod
+    def definition():
+        tool = TestSandboxTool.create(None)[0]
+        return {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.to_mcp_tool()["inputSchema"],
+            "annotations": None,
+        }
 
 os.environ["OPENHANDS_SUPPRESS_BANNER"] = "1"
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
@@ -22,6 +75,16 @@ class FakeSandbox:
         self.closed = False
         self.commands = []
         self.files = []
+        self.worker = None
+
+    def start_tools(self, config, run_dir):
+        self.worker = FakeWorker(self)
+        return {
+            "worker_pid": 1000,
+            "tools": [self.worker.definition()],
+            "skills": [],
+            "source_sha256": config["source_sha256"],
+        }
 
     def upload(self, attachment):
         self.files.append(attachment.name)

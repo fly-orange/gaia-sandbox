@@ -1,18 +1,16 @@
-from __future__ import annotations
-
 import contextlib
 import functools
 import inspect
 import sys
-from collections.abc import Callable, Iterator, Mapping
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from openhands.sdk.logger import get_logger
 from openhands.sdk.observability.utils import get_env
 
 
 if TYPE_CHECKING:
-    from openhands.sdk.conversation.types import TraceMetadataValue
+    pass
 
 
 logger = get_logger(__name__)
@@ -30,10 +28,6 @@ _OBSERVABILITY_ENV_KEYS: Final[tuple[str, ...]] = (
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
 )
-
-
-OPERATION_METADATA_KEY: Final[str] = "openhands.operation"
-"""Metadata key naming the side-utility operation a span subtree belongs to."""
 
 
 def _get_int_env(key: str) -> int | None:
@@ -94,9 +88,6 @@ def maybe_init_laminar():
 
     from lmnr import Instruments, Laminar
 
-    if Laminar.is_initialized():
-        return
-
     base_url = get_env("LMNR_BASE_URL") or None
     force_http = _get_bool_env("LMNR_FORCE_HTTP")
 
@@ -133,6 +124,7 @@ def observe[**P, R](
     metadata: dict[str, Any] | None = None,
     tags: list[str] | None = None,
     preserve_global_context: bool = False,
+    rollout_entrypoint: bool = False,
     **kwargs: dict[str, Any],
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Lazy-resolving observe decorator.
@@ -158,6 +150,7 @@ def observe[**P, R](
             metadata=metadata,
             tags=tags,
             preserve_global_context=preserve_global_context,
+            rollout_entrypoint=rollout_entrypoint,
             **kwargs,
         )(func)
 
@@ -199,30 +192,6 @@ def observe[**P, R](
         return sync_wrapper
 
     return decorator
-
-
-# Keep owner first so observe can restore its conversation root span.
-def _return_tool_result(owner: object, tool_input: Any, tool_output: Any) -> Any:
-    _ = owner, tool_input
-    return tool_output
-
-
-def record_tool_result(
-    owner: object,
-    *,
-    name: str,
-    tool_call_id: str,
-    tool_input: Any,
-    tool_output: Any,
-) -> None:
-    if not should_enable_observability():
-        return
-    observe(
-        name=name,
-        span_type="TOOL",
-        ignore_inputs=["owner", "tool_output"],
-        metadata={"tool_call_id": tool_call_id},
-    )(_return_tool_result)(owner, tool_input, tool_output)
 
 
 def should_enable_observability() -> bool:
@@ -284,39 +253,21 @@ class RootSpan:
         name: str,
         session_id: str | None = None,
         user_id: str | None = None,
-        attributes: Mapping[str, str] | None = None,
-        metadata: dict[str, TraceMetadataValue] | None = None,
-        tags: list[str] | None = None,
     ) -> None:
         from lmnr import Laminar
 
         # ``start_span`` returns a span without attaching it as the current
         # OTel context; we'll restore it on every entry point via ``use_span``.
         self.span = Laminar.start_span(name)
-        if attributes:
+        if session_id or user_id:
+            # ``set_trace_session_id`` / ``set_trace_user_id`` require an
+            # active span; briefly enter the span context to apply them.
             with contextlib.suppress(Exception):
-                for key, value in attributes.items():
-                    self.span.set_attribute(key, value)
-        if session_id or user_id or metadata or tags:
-            # These trace/span helpers require an active span; briefly enter
-            # the span context to apply conversation-level observability data.
-            with contextlib.suppress(Exception):
-                with Laminar.use_span(
-                    self.span,
-                    # Don't mark the span ERROR if a helper raises.
-                    record_exception=False,
-                    set_status_on_exception=False,
-                ):
+                with Laminar.use_span(self.span):
                     if session_id:
                         Laminar.set_trace_session_id(session_id)
                     if user_id:
                         Laminar.set_trace_user_id(user_id)
-                    if metadata:
-                        # dict is invariant: dict[str, TraceMetadataValue] is
-                        # not assignable to dict[str, Any] without a cast.
-                        Laminar.set_trace_metadata(cast(dict[str, Any], metadata))
-                    if tags:
-                        Laminar.set_span_tags(tags)
         self._ended = False
 
     def end(self) -> None:
@@ -334,9 +285,6 @@ def start_root_span(
     name: str,
     session_id: str | None = None,
     user_id: str | None = None,
-    attributes: Mapping[str, str] | None = None,
-    metadata: dict[str, TraceMetadataValue] | None = None,
-    tags: list[str] | None = None,
 ) -> RootSpan | None:
     """Create a long-lived root span for an owning object.
 
@@ -345,14 +293,7 @@ def start_root_span(
     if not should_enable_observability():
         return None
     try:
-        return RootSpan(
-            name,
-            session_id=session_id,
-            user_id=user_id,
-            attributes=attributes,
-            metadata=metadata,
-            tags=tags,
-        )
+        return RootSpan(name, session_id=session_id, user_id=user_id)
     except Exception:
         logger.debug("Failed to create observability root span", exc_info=True)
         return None
@@ -363,98 +304,6 @@ def end_root_span(root: RootSpan | None) -> None:
     if root is None:
         return
     root.end()
-
-
-def start_child_span(
-    root: RootSpan | None,
-    name: str,
-    tags: list[str] | None = None,
-) -> None:
-    """Create and immediately end a child span under a conversation root span."""
-    if root is None or root.span is None:
-        return
-    try:
-        from lmnr import Laminar
-
-        with Laminar.use_span(
-            root.span,
-            record_exception=False,
-            set_status_on_exception=False,
-        ):
-            with Laminar.start_as_current_span(name=name):
-                if tags:
-                    Laminar.set_span_tags(tags)
-    except Exception:
-        logger.debug("Failed to create observability child span", exc_info=True)
-
-
-# Trace-metadata key set by software-agent-sdk#4010 on the parent's `task`
-# TOOL span; copied onto a detached delegate trace when present so the
-# originating tool call is visible from the delegate's trace alone.
-_TOOL_CALL_ID_META_KEY: Final[str] = "tool_call_id"
-
-
-@contextlib.contextmanager
-def detached_delegate_context() -> Iterator[dict[str, TraceMetadataValue]]:
-    """Clear the ambient span so a conversation constructed inside this block
-    starts a genuinely new Laminar trace, instead of ``RootSpan`` silently
-    joining whatever span is currently active.
-
-    ``Laminar.start_span`` without an explicit ``context=`` parents onto the
-    ambient span — its "isolated context" helper just returns whatever is
-    current. Laminar tracks that "current" span via its OWN isolated
-    ``ContextVar`` (``lmnr...tracing.context._ISOLATED_RUNTIME_CONTEXT``),
-    separate from the standard ``opentelemetry.context`` one, so attaching an
-    empty/no-parent context through the standard API (as ``RootSpan`` does
-    for cross-thread re-attachment) has no effect here — ``Laminar.use_span``
-    is the one call that updates both. Pushing ``INVALID_SPAN`` through it is
-    what actually severs the link, so a sub-agent conversation constructed
-    synchronously inside its parent's ``task`` TOOL span (see TaskManager)
-    starts its own trace instead of inheriting the parent's
-    (software-agent-sdk#4365).
-
-    Yields trace-metadata linking the delegate back to the severed parent
-    span (``delegate.parent_trace_id``/``delegate.parent_span_id``, plus a
-    best-effort ``tool_call_id`` copied from the parent's TOOL span) for the
-    caller to merge into the delegate's ``observability_metadata``. Yields an
-    empty dict if there is no active span, or if observability is disabled.
-    """
-    if not should_enable_observability():
-        yield {}
-        return
-    try:
-        from lmnr import Laminar
-        from opentelemetry import trace as otel_trace
-
-        parent = Laminar.get_laminar_span_context()
-    except Exception:
-        logger.debug("Failed to capture parent span for delegate", exc_info=True)
-        yield {}
-        return
-
-    link: dict[str, TraceMetadataValue] = {}
-    if parent is not None:
-        link["delegate.parent_trace_id"] = str(parent.trace_id)
-        link["delegate.parent_span_id"] = str(parent.span_id)
-        tool_call_id = (parent.metadata or {}).get(_TOOL_CALL_ID_META_KEY)
-        if tool_call_id:
-            link[_TOOL_CALL_ID_META_KEY] = tool_call_id
-
-    # Only guard *entering* Laminar.use_span (a caller exception raised
-    # inside the ``with`` block below must propagate normally, not be
-    # swallowed here).
-    with contextlib.ExitStack() as stack:
-        try:
-            stack.enter_context(
-                Laminar.use_span(
-                    otel_trace.INVALID_SPAN,
-                    record_exception=False,
-                    set_status_on_exception=False,
-                )
-            )
-        except Exception:
-            logger.debug("Failed to detach ambient span for delegate", exc_info=True)
-        yield link
 
 
 @contextlib.contextmanager

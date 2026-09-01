@@ -40,7 +40,7 @@ class HookType(StrEnum):
     """Types of hooks that can be executed."""
 
     COMMAND = "command"  # Shell command executed via subprocess
-    PROMPT = "prompt"  # Single-completion LLM evaluation
+    PROMPT = "prompt"  # LLM-based evaluation (future)
     AGENT = "agent"  # Agent-based evaluation with tool access
 
 
@@ -89,10 +89,6 @@ class HookDefinition(BaseModel):
             raise ValueError("'command' is required when type is 'command'")
         if self.type == HookType.PROMPT and not self.prompt:
             raise ValueError("'prompt' is required when type is 'prompt'")
-        if self.type == HookType.PROMPT and self.command:
-            raise ValueError("'command' must not be set when type is 'prompt'")
-        if self.type == HookType.PROMPT and self.async_:
-            raise ValueError("'async' is not supported for prompt hooks")
         if self.type == HookType.AGENT and self.command:
             raise ValueError(
                 "'command' must not be set when type is 'agent'; "
@@ -107,14 +103,11 @@ class HookDefinition(BaseModel):
         """Human-readable label for this hook used in logs and events."""
         if self.command:
             return self.command
-        prefix = f"{self.type.value}-hook"
         if self.name is not None:
-            return f"{prefix}:{self.name}"
-        if self.type == HookType.PROMPT and self.prompt:
-            return f"{prefix}:{self.prompt[:20]}"
-        if self.type == HookType.AGENT and self.system_prompt:
-            return f"{prefix}:{self.system_prompt[:20]}"
-        return f"{prefix}:{self.type.value}"
+            return f"agent-hook:{self.name}"
+        if self.system_prompt:
+            return f"agent-hook:{self.system_prompt[:20]}"
+        return "agent-hook:agent"
 
 
 class HookMatcher(BaseModel):

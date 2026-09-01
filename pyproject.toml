@@ -1,10 +1,12 @@
 [project]
 name = "gaia-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 description = "One persistent OpenHands SDK service, isolated Docker sandbox per GAIA task"
 requires-python = ">=3.12"
 dependencies = [
-  "openhands-sdk==1.44.1", "fastapi>=0.115,<1", "uvicorn>=0.30,<1",
+  "openhands-sdk==1.27.0", "openhands-tools==1.27.0",
+  "litellm==1.93.0", "browser-use==0.11.13", "fastmcp==3.1.0", "mcp==1.26.0",
+  "fastapi>=0.115,<1", "uvicorn>=0.30,<1",
   "docker>=7.1,<8", "psutil>=6,<8", "httpx>=0.27,<1",
   "python-dotenv>=1,<2",
 ]
@@ -12,6 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 data = ["pandas>=2.2", "pyarrow>=17", "huggingface-hub>=0.26"]
 test = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.9"]
+sandbox = ["pandas>=2.2", "openpyxl", "pypdf", "python-docx", "python-pptx", "beautifulsoup4"]
 
 [project.scripts]
 gaia-sandbox = "gaia_shared.cli:main"
@@ -25,6 +28,7 @@ packages = ["src/gaia_shared"]
 
 [tool.uv.sources]
 openhands-sdk = { path = "vendor/software-agent-sdk/openhands-sdk", editable = true }
+openhands-tools = { path = "vendor/software-agent-sdk/openhands-tools", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

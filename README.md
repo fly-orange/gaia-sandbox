@@ -12,9 +12,9 @@ GAIA client（题目、附件；标准答案不发送到服务）
                     │ HTTP
                     ▼
 常驻服务：一个 PID / 一个 asyncio event loop
-  ├─ Conversation A / OpenHands Agent A ──→ Docker A（工具环境）
-  ├─ Conversation B / OpenHands Agent B ──→ Docker B（工具环境）
-  └─ Conversation C / OpenHands Agent C ──→ Docker C（工具环境）
+  ├─ Conversation A / OpenHands Agent A ──→ Docker A（独立工具 worker）
+  ├─ Conversation B / OpenHands Agent B ──→ Docker B（独立工具 worker）
+  └─ Conversation C / OpenHands Agent C ──→ Docker C（独立工具 worker）
           │
           └── 共用一个外部 vLLM endpoint
 ```
@@ -33,17 +33,18 @@ cd gaia-sandbox
 uv sync --locked --extra data --extra test
 cp config.example.toml config.toml
 cp .env.example .env
-docker build -f docker/sandbox.Dockerfile -t gaia-sandbox:0.1 .
+docker build -f docker/sandbox.Dockerfile -t gaia-sandbox:0.2 .
 ```
 
-在 `.env` 中设置随机 `GAIA_SERVER_TOKEN` 和 `VLLM_API_KEY`。
+在 `.env` 中设置随机 `GAIA_SERVER_TOKEN`、`VLLM_API_KEY` 和 `TAVILY_API_KEY`。
 在 `config.toml` 中设置模型名称、URL 和 GAIA 数据路径。默认绑定 `127.0.0.1:8765`。
 源码采用 editable 安装，修改 `src/` 或 `vendor/` 后重启服务即可生效。
 
 **模型 URL 从常驻服务所在机器访问**，不再从每题沙箱访问。因此，vLLM 位于同一
 宿主机时应使用 `http://127.0.0.1:8000/v1`，而不是 `host.docker.internal`。
 示例模型 ID 仅为配置示例，请换成 vLLM 实际的 served-model-name；本项目不替你选择
-模型的 tool-call parser。图片题需模型本身支持视觉输入。
+模型的 tool-call parser。图片题需模型本身支持视觉输入，并把 `llm.vision=true`；
+纯文本模型应保持默认的 `false`，这也会让 FileEditor 使用非视觉说明。
 
 ```bash
 uv run gaia-sandbox plan
@@ -67,8 +68,9 @@ uv run gaia-sandbox download
 ```
 
 `gaia.level=0` 表示所有难度，`gaia.limit=0` 表示所有题。默认仅 3 题、1 worker。
-每次请求最多一个附件、20 MiB；超限明确报错，不静默跳过。ZIP 以原文件上传，
-由 Agent 在自己的沙箱中解压，不在控制进程解压。标准答案只在评测客户端评分。
+附件总量最多 20 MiB。与固定的 OpenHands GAIA 基线一致：图片作为模型的 image
+content 发送而不写入工作区；普通文件统一命名为 `/workspace/file.<扩展名>`；ZIP 在
+可信评测客户端安全展开后逐文件写入题目沙箱。标准答案只在评测客户端评分。
 test split 没有公开答案，因此 `score/accuracy=null`，不会伪报为 0 分。
 
 ## 3. 启动常驻服务，再运行评测
@@ -107,6 +109,8 @@ runs/server/<server_id>/
   <run_id>/
     request.json             题目与附件名；不含标准答案
     events.jsonl             SDK 事件轨迹与采集时间戳
+    tool-calls.jsonl         每次工具调用的工具名、状态和沙箱往返时间
+    tool-worker.log          题目沙箱内工具 worker 的 stderr/异常日志
     sandbox-metrics.jsonl    该题容器 CPU、内存、网络、块 I/O、进程数和阶段
     result.json              答案、LLM metrics、时延、容器 ID 和错误/清理状态
 runs/evaluation/
@@ -131,15 +135,21 @@ usage，可能包含页缓存，不等同于 RSS。1 秒采样可能漏掉短峰
 
 ## 5. 工具与可比性
 
-Agent 使用 OpenHands SDK 原生推理循环，工具集合固定为沙箱 Bash、Finish、Think。
-沙箱预装 Python、requests、文档处理、ffmpeg、OCR 和 Playwright/Chromium。
-Agent 可通过 Python 操作浏览器。图片附件直接送入支持视觉的模型。
+Agent 使用固定 OpenHands benchmark 基线的 SDK 推理循环和默认工具预设。每个题目
+容器启动一个**工具 worker**，在容器内初始化并执行 Terminal、FileEditor、
+TaskTracker、browser-use 完整工具集合、Tavily MCP、Fetch MCP 和 InvokeSkill；
+Finish/Think 仍是 SDK 内建控制工具。宿主 Agent 只取得这些工具的 JSON Schema，
+将 action 定向到对应 worker，并接收已在容器内渲染/截断的 observation。浏览器状态、
+shell 状态、文件系统、MCP 进程和 invoked-skills 状态因此都按题隔离。
 
-这里**没有原版 GAIA 的 Tavily MCP 和原版 browser-use 工具集合**；也没有自动
-把浏览器截图作为新的视觉 observation 回传模型。首版目的是清晰测量共享服务架构，
-不是声称复现原版 GAIA 分数。工具集合、prompt、环境变化都会影响成绩和负载。
-公开结果请标注 `gaia-sandbox/sandbox-command`，记录模型、镜像 ID、源码指纹，
-勿与原版 OpenHands 得分当作只有部署架构不同的严格 A/B 实验。
+本仓还固定了 GAIA prompt、fake-user 续答逻辑、LLM summarizing condenser 和 60 个
+公共 skill。Docker 镜像预装 Chromium、ffmpeg、OCR、文档处理依赖及两个 MCP server。
+Tavily 默认开启且缺少 key 时服务拒绝启动；离线消融可显式设置 `agent.tavily=false`。
+
+目标是保持 `OpenHands/benchmarks` 该固定版本的 GAIA **功能配置**，同时改变部署拓扑；
+它不是原版 Agent Server REST/API/UI 的兼容实现。容器基础镜像、worker 传输和共享宿主
+Agent 仍是实验变量。公开结果应记录源码 SHA、镜像 ID、模型、配置和工具列表，并先做
+同模型小样本回归，不应在未经实测时宣称与原版得分严格等价。
 
 ## 6. 安全边界
 
@@ -151,15 +161,16 @@ Agent 可通过 Python 操作浏览器。图片附件直接送入支持视觉的
 - Docker 不是对恶意多租户的完整安全边界；不要放生产数据。题目能消耗容器磁盘空间，
   当前未配置每容器磁盘配额；建议专用磁盘/VM，并监控磁盘使用量。
 - 工具输出在容器内截断，再送到服务；原始日志可能包含题目敏感数据，`runs/` 不提交。
-- 不使用用户技能/项目技能/全局视觉工具。新增工具必须通过绑定的 sandbox 执行，
+- 不使用用户技能/项目技能；只加载仓内固定公共 skill。新增执行型工具必须通过绑定的 sandbox 执行，
   不要加本地 Terminal/FileEditor/MCP subprocess 绕过边界。
 - 正常结束和异常会清理容器；kill -9/宿主崩溃可能留下容器。只按
   `gaia.role=sandbox` 和对应 `gaia.run_id` 检查清理，禁止全局 docker prune。
 
 ## 7. 版本管理与 GitHub
 
-`vendor/software-agent-sdk/` 是普通源码目录，不是 git submodule，没有内部 `.git`，
-没有 `.upstream`。来源 SHA、许可证和本地补丁见 [vendor/PROVENANCE.md](vendor/PROVENANCE.md)。
+`vendor/software-agent-sdk/`、`vendor/benchmarks/` 和 `vendor/extensions/` 都是普通源码目录，
+不是 git submodule，没有内部 `.git`，也没有 `.upstream`。固定来源 SHA、许可证、导入
+范围和本地补丁见 [vendor/PROVENANCE.md](vendor/PROVENANCE.md)。
 `uv.lock` 固定依赖解析结果，SDK 使用仓内源码。修改 SDK 和平台代码可放在同一个 commit。
 
 ```bash
@@ -182,10 +193,11 @@ uv run ruff check src tests
 RUN_DOCKER_TESTS=1 uv run pytest -m docker -q
 ```
 
-默认测试使用真实 SDK，但模拟 LLM 回复和 Docker。它们验证共享 PID、独立会话、
-工具定向、并发限制、超时清理、鉴权、附件路径和评分。不能替代真实模型/容器验收。
+默认测试使用真实 SDK 和真实的独立工具 worker 进程，但模拟 LLM 回复和 Docker。它们验证
+共享 PID、独立会话、动态工具 Schema/执行定向、并发限制、超时清理、鉴权、附件语义
+和评分。不能替代真实模型/容器验收。
 完整验收：先通过 Docker isolation 测试，再通过 doctor，跑一题，再跑两题并发，
 核对 server_id/server_pid 一致、container_id 不同，以及题后容器已回收。
 
-本地 Python 3.12 + 真实 SDK 测试可运行；当前开发机没有 Docker，也没有已配置的
+本地 Python 3.12 + 固定 SDK 测试可运行；当前开发机没有 Docker，也没有已配置的
 模型服务，因此不能宣称已跑通真实 GAIA。参见 [VALIDATION.md](VALIDATION.md)。
